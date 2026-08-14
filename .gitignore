@@ -1,0 +1,18 @@
+# 密钥与环境 (绝不提交)
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 运行数据 (本地知识库落盘文件)
+fusionrag_workspace/
+
+# PPT 构建中间产物 (node_modules 等)
+.pptx-build/
+*.pptx
+
+# 杂项
+*.tmp
+.DS_Store

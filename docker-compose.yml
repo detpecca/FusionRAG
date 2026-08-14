@@ -1,0 +1,14 @@
+services:
+  fusionrag:
+    build: .
+    container_name: fusionrag
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env          # 参照 .env.example 配置, 至少填 LLM_API_KEY
+    volumes:
+      - fusionrag_data:/app/fusionrag_workspace   # 知识库数据持久化
+    restart: unless-stopped
+
+volumes:
+  fusionrag_data:
