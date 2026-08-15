@@ -517,6 +517,8 @@ class FusionRAG:
             self.entities_vdb.index_done_callback(),
             self.relationships_vdb.index_done_callback(),
             self.graph.index_done_callback(),
+            # llm 缓存平时脏计数节流落盘, 这里兜底 flush
+            self.llm_cache.index_done_callback(),
         )
 
     # ------------------------------------------------------------------ 查询

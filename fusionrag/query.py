@@ -230,10 +230,10 @@ async def _chunks_from_sources(
     if not valid:
         return []
 
-    # 用 chunks_vdb 里已存的向量与 query 计算相似度
+    # 用 chunks_vdb 里已存的向量与 query 计算相似度 (批量取, 避免逐 id 锁竞争)
+    stored_list = await chunks_vdb.get_by_ids([cid for cid, _ in valid])
     vectors, kept = [], []
-    for cid, rec in valid:
-        stored = await chunks_vdb.get_by_id(cid)
+    for (cid, rec), stored in zip(valid, stored_list):
         if stored is not None:
             vectors.append(stored["vector"])
             kept.append((cid, rec))
@@ -255,12 +255,16 @@ async def _chunks_from_sources(
 
 async def _naive_retrieve(
     query: str,
+    query_embedding: np.ndarray,
     param: QueryParam,
     config: FusionRAGConfig,
     chunks_vdb: BaseVectorStorage,
 ) -> list[dict]:
+    # 复用调用方已算好的 query_embedding, 避免向量库再 embed 一次
     results = await chunks_vdb.query(
-        query=query, top_k=param.chunk_top_k, threshold=config.cosine_threshold
+        query_embedding=query_embedding,
+        top_k=param.chunk_top_k,
+        threshold=config.cosine_threshold,
     )
     return [
         {
@@ -376,7 +380,9 @@ async def rag_query(
     ll_keywords: list[str] = []
 
     if param.mode == "naive":
-        vector_chunks = await _naive_retrieve(query, param, config, chunks_vdb)
+        vector_chunks = await _naive_retrieve(
+            query, query_embedding, param, config, chunks_vdb
+        )
     else:
         # 1. 关键词提取 (允许调用方预置)
         hl_keywords = param.hl_keywords
@@ -411,7 +417,9 @@ async def rag_query(
             local_relations, global_relations, lambda r: tuple(sorted((r["src_id"], r["tgt_id"])))
         )
         if param.mode == "hybrid":
-            vector_chunks = await _naive_retrieve(query, param, config, chunks_vdb)
+            vector_chunks = await _naive_retrieve(
+                query, query_embedding, param, config, chunks_vdb
+            )
 
     # 3. token 预算截断 (实体/关系各自限额)
     entities = truncate_list_by_token_size(

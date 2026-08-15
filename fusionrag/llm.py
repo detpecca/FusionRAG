@@ -40,9 +40,16 @@ def _is_retryable(exc: Exception) -> bool:
 class LLMService:
     """统一的 LLM/Embedding 入口。config.llm_func / embedding_func 可注入自定义实现(测试用)。"""
 
+    # 每积累多少条缓存写执行一次落盘
+    CACHE_FLUSH_EVERY = 32
+
     def __init__(self, config: FusionRAGConfig, cache_kv: Any = None) -> None:
         self.config = config
         self._cache_kv = cache_kv
+        # 缓存脏计数节流: JSON 后端每次 index_done_callback 全量重写文件,
+        # 每次调用都 flush 会造成 O(N^2) 磁盘写放大, 攒够 CACHE_FLUSH_EVERY
+        # 条再落盘; 导入结束时 core._flush() 兜底
+        self._cache_dirty = 0
         self._llm_sem = asyncio.Semaphore(config.llm_max_async)
         self._emb_sem = asyncio.Semaphore(config.embedding_max_async)
         self._custom_llm = config.llm_func
@@ -144,7 +151,10 @@ class LLMService:
             await self._cache_kv.upsert(
                 {cache_key: {"content": content, "cache_type": cache_type}}
             )
-            await self._cache_kv.index_done_callback()
+            self._cache_dirty += 1
+            if self._cache_dirty >= self.CACHE_FLUSH_EVERY:
+                await self._cache_kv.index_done_callback()
+                self._cache_dirty = 0
         return content
 
     async def _openai_chat(

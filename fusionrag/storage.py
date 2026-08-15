@@ -90,6 +90,10 @@ class BaseVectorStorage(ABC):
     @abstractmethod
     async def get_by_id(self, doc_id: str) -> Optional[dict]: ...
 
+    async def get_by_ids(self, ids: list[str]) -> list[Optional[dict]]:
+        """批量取记录。默认逐个回退; 后端可覆盖为单次加锁实现以减少锁竞争。"""
+        return [await self.get_by_id(i) for i in ids]
+
     @abstractmethod
     async def index_done_callback(self) -> None: ...
 
@@ -290,6 +294,10 @@ class SimpleVectorStorage(BaseVectorStorage):
     async def get_by_id(self, doc_id: str) -> Optional[dict]:
         async with self._lock:
             return self._data.get(doc_id)
+
+    async def get_by_ids(self, ids: list[str]) -> list[Optional[dict]]:
+        async with self._lock:
+            return [self._data.get(i) for i in ids]
 
     async def index_done_callback(self) -> None:
         async with self._lock:
