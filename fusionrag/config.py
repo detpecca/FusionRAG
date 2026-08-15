@@ -40,10 +40,17 @@ class FusionRAGConfig:
     working_dir: str = "./fusionrag_workspace"
     # 存储后端: 每类存储可独立选后端。storage_backend 为总兜底,
     # 优先级 kv_backend > storage_backend > "json" (vector/graph 同理)。
-    storage_backend: str = "json"     # 总兜底: json(默认, 零依赖)
-    kv_backend: str = ""              # KV 后端: json / sqlite; 空则回退 storage_backend
-    vector_backend: str = ""          # 向量后端: json; 空则回退 storage_backend
-    graph_backend: str = ""           # 图后端: json; 空则回退 storage_backend
+    # 总开关 storage_backend="postgres" = 全家桶 (KV=postgres 表,
+    # 向量=pgvector, 图=Apache AGE), 需要配置 postgres_dsn。
+    storage_backend: str = "json"     # 总兜底: json(默认, 零依赖) / postgres(全家桶)
+    kv_backend: str = ""              # KV 后端: json / sqlite / postgres; 空则回退 storage_backend
+    vector_backend: str = ""          # 向量后端: json / pgvector; 空则回退 storage_backend
+    graph_backend: str = ""           # 图后端: json / age; 空则回退 storage_backend
+    # PostgreSQL 连接串 (postgres 系后端必填); 按类覆盖可把三类存储拆到不同实例
+    postgres_dsn: str = ""            # 例: postgresql://user:pass@host:5432/fusionrag
+    pg_dsn_kv: str = ""
+    pg_dsn_vector: str = ""
+    pg_dsn_graph: str = ""
 
     def resolve_kv_backend(self) -> str:
         return self.kv_backend or self.storage_backend or "json"
@@ -125,6 +132,10 @@ class FusionRAGConfig:
             kv_backend=_env("KV_BACKEND", cls.kv_backend),
             vector_backend=_env("VECTOR_BACKEND", cls.vector_backend),
             graph_backend=_env("GRAPH_BACKEND", cls.graph_backend),
+            postgres_dsn=_env("POSTGRES_DSN", cls.postgres_dsn),
+            pg_dsn_kv=_env("PG_DSN_KV", cls.pg_dsn_kv),
+            pg_dsn_vector=_env("PG_DSN_VECTOR", cls.pg_dsn_vector),
+            pg_dsn_graph=_env("PG_DSN_GRAPH", cls.pg_dsn_graph),
             llm_model=_env("LLM_MODEL", cls.llm_model),
             llm_api_key=_env("LLM_API_KEY", cls.llm_api_key),
             llm_base_url=_env("LLM_BASE_URL", cls.llm_base_url),

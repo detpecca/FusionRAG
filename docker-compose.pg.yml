@@ -1,0 +1,45 @@
+# PostgreSQL 全家桶部署: 单一 PG 实例承载 KV + 向量(pgvector) + 图(AGE)。
+# 用法: docker compose -f docker-compose.pg.yml up -d
+# 服务启动后设置 .env 中 STORAGE_BACKEND=postgres (或经 environment 注入, 见下)。
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.pg
+    container_name: fusionrag-postgres
+    environment:
+      POSTGRES_USER: fusionrag
+      POSTGRES_PASSWORD: fusionrag   # 生产环境请修改
+      POSTGRES_DB: fusionrag
+    ports:
+      - "5432:5432"
+    volumes:
+      - fusionrag_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fusionrag -d fusionrag"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  fusionrag:
+    build: .
+    container_name: fusionrag
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env          # LLM_API_KEY 等仍在 .env 配置
+    environment:
+      STORAGE_BACKEND: postgres
+      POSTGRES_DSN: postgresql://fusionrag:fusionrag@postgres:5432/fusionrag
+      WORKING_DIR: /app/fusionrag_workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - fusionrag_data:/app/fusionrag_workspace
+    restart: unless-stopped
+
+volumes:
+  fusionrag_pgdata:
+  fusionrag_data:

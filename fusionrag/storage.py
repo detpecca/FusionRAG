@@ -441,6 +441,20 @@ def _resolve(config: Any, resolver: str, attr: str, default: str = "json") -> st
     return getattr(config, attr, None) or getattr(config, "storage_backend", default) or default
 
 
+def _pg_dsn(config: Any, kind: str) -> str:
+    """取 PostgreSQL 连接串: 按类覆盖 (pg_dsn_kv/vector/graph) > postgres_dsn。
+
+    缺失时显式报错而不是静默回退 JSON —— 存储后端选错会导致数据"消失"。
+    """
+    dsn = getattr(config, f"pg_dsn_{kind}", "") or getattr(config, "postgres_dsn", "")
+    if not dsn:
+        raise ValueError(
+            f"PostgreSQL 系后端 ({kind}) 需要连接串: 请在配置中设置 postgres_dsn "
+            f"(环境变量 POSTGRES_DSN), 或按类设置 pg_dsn_{kind} (PG_DSN_{kind.upper()})"
+        )
+    return dsn
+
+
 def create_kv_storage(namespace: str, working_dir: str, config: Any) -> BaseKVStorage:
     backend = _resolve(config, "resolve_kv_backend", "kv_backend")
     if backend == "json":
@@ -449,8 +463,12 @@ def create_kv_storage(namespace: str, working_dir: str, config: Any) -> BaseKVSt
         from .storage_sqlite import SqliteKVStorage  # 延迟 import, 默认 json 用户不加载
 
         return SqliteKVStorage(namespace, working_dir)
+    if backend == "postgres":
+        from .storage_pg import PostgresKVStorage  # 需要 asyncpg, 延迟 import
+
+        return PostgresKVStorage(namespace, _pg_dsn(config, "kv"))
     raise ValueError(
-        f"未知的 KV 存储后端 KV_BACKEND={backend!r}, 目前支持: 'json' / 'sqlite'"
+        f"未知的 KV 存储后端 KV_BACKEND={backend!r}, 目前支持: 'json' / 'sqlite' / 'postgres'"
     )
 
 
@@ -464,8 +482,15 @@ def create_vector_storage(
     backend = _resolve(config, "resolve_vector_backend", "vector_backend")
     if backend == "json":
         return SimpleVectorStorage(namespace, working_dir, embedding_func, embedding_dim)
+    if backend in ("pgvector", "postgres"):  # 总开关 postgres 在向量类映射为 pgvector
+        from .storage_pg import PgvectorStorage
+
+        return PgvectorStorage(
+            namespace, _pg_dsn(config, "vector"), embedding_func, embedding_dim
+        )
     raise ValueError(
-        f"未知或暂不支持的向量存储后端 VECTOR_BACKEND={backend!r}, 目前支持: 'json'"
+        f"未知或暂不支持的向量存储后端 VECTOR_BACKEND={backend!r}, "
+        "目前支持: 'json' / 'pgvector'"
     )
 
 
@@ -475,6 +500,11 @@ def create_graph_storage(
     backend = _resolve(config, "resolve_graph_backend", "graph_backend")
     if backend == "json":
         return NetworkXGraphStorage(namespace, working_dir)
+    if backend in ("age", "postgres"):  # 总开关 postgres 在图类映射为 AGE
+        from .storage_pg import AGEGraphStorage
+
+        return AGEGraphStorage(namespace, _pg_dsn(config, "graph"))
     raise ValueError(
-        f"未知或暂不支持的图存储后端 GRAPH_BACKEND={backend!r}, 目前支持: 'json'"
+        f"未知或暂不支持的图存储后端 GRAPH_BACKEND={backend!r}, "
+        "目前支持: 'json' / 'age'"
     )

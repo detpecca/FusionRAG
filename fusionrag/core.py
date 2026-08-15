@@ -81,7 +81,15 @@ class FusionRAG:
         self.config = config or FusionRAGConfig.from_env()
         os.makedirs(self.config.working_dir, exist_ok=True)
         wd = self.config.working_dir
-        _acquire_instance_lock(wd)
+        # 单实例锁只保护文件型后端 (json/sqlite 的"进程内存+落盘"模型);
+        # PostgreSQL 系后端 (postgres/pgvector/age) 由 MVCC+行锁保证多进程安全
+        file_backends = (
+            self.config.resolve_kv_backend() in ("json", "sqlite")
+            and self.config.resolve_vector_backend() == "json"
+            and self.config.resolve_graph_backend() == "json"
+        )
+        if file_backends:
+            _acquire_instance_lock(wd)
 
         # KV 存储
         self.full_docs = create_kv_storage("full_docs", wd, self.config)            # 文档原文与状态

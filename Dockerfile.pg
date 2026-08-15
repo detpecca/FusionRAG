@@ -1,0 +1,15 @@
+# PostgreSQL 全家桶镜像: Apache AGE (图) + pgvector (向量) 同库共存。
+# 供 docker-compose.pg.yml 构建; 配合 STORAGE_BACKEND=postgres 使用。
+FROM apache/age:latest
+
+# 在 AGE 镜像上编译安装 pgvector (编译工具用完即删, 保持镜像精简)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        postgresql-server-dev-18 git make gcc libc6-dev \
+    && git clone --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
+    && make -C /tmp/pgvector -j "$(nproc)" \
+    && make -C /tmp/pgvector install \
+    && rm -rf /tmp/pgvector \
+    && apt-get purge -y postgresql-server-dev-18 git make gcc libc6-dev \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*

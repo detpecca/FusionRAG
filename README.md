@@ -69,8 +69,15 @@ python -m fusionrag       # http://localhost:8000
 
 ## 存储设计
 
-全部持久化在 `WORKING_DIR` 下（默认 JSON 原子写，KV 可切换 SQLite），零外部服务依赖：
-通过 `KV_BACKEND` / `VECTOR_BACKEND` / `GRAPH_BACKEND` 可独立替换后端。
+默认全部持久化在 `WORKING_DIR` 下（JSON 原子写，KV 可切换 SQLite），零外部服务依赖；
+通过 `KV_BACKEND` / `VECTOR_BACKEND` / `GRAPH_BACKEND` 可独立替换后端，
+或用总开关 `STORAGE_BACKEND=postgres` 一键切换 **PostgreSQL 全家桶**
+（KV=表+JSONB，向量=pgvector + HNSW 索引，图=Apache AGE）——
+单实例承载三类存储，获得多进程/多 worker 安全（MVCC+行锁）、即时持久化与索引级向量检索：
+
+```bash
+docker compose -f docker-compose.pg.yml up -d   # 一键起 AGE+pgvector 合一镜像与服务
+```
 
 | 存储 | 类型 | 用途 |
 |---|---|---|
@@ -82,6 +89,8 @@ python -m fusionrag       # http://localhost:8000
 | `graph_chunk_entity_relation` | 图 | 知识图谱：实体节点 + 关系边；local/global 检索的一跳扩展 |
 | `vdb_entities` / `vdb_relationships` | 向量库 | 实体/关系向量；local / global 检索入口 |
 | `kv_chat_sessions` | KV | 多轮对话历史（滑动窗口） |
+
+后端矩阵：KV 支持 `json` / `sqlite` / `postgres`；向量支持 `json` / `pgvector`；图支持 `json` / `age`。
 
 ## API 概览
 
@@ -99,7 +108,7 @@ python -m fusionrag       # http://localhost:8000
 
 > **部署注意**
 >
-> - **单进程运行**：JSON/SQLite 存储为进程内内存 + 全量落盘，**不支持多进程共享同一工作目录**。请勿使用 `uvicorn --workers 2` 或多容器挂载同一 volume；启动时会用 `instance.lock`（PID 锁文件）检测冲突并拒绝启动，确认无其他实例后删除该文件即可。
+> - **单进程运行（JSON/SQLite 后端）**：文件型存储为进程内内存 + 全量落盘，**不支持多进程共享同一工作目录**。请勿使用 `uvicorn --workers 2` 或多容器挂载同一 volume；启动时会用 `instance.lock`（PID 锁文件）检测冲突并拒绝启动，确认无其他实例后删除该文件即可。使用 `STORAGE_BACKEND=postgres` 全家桶时无此限制（MVCC + 行锁，多 worker 安全，自动跳过该锁）。
 > - **API 鉴权（可选）**：默认无鉴权，仅适合内网/个人使用。设置环境变量 `FUSIONRAG_API_KEY` 后，所有 `/api/*` 端点要求 `Authorization: Bearer <key>` 或 `X-API-Key` 请求头。
 
 ## 配置
@@ -115,7 +124,9 @@ python -m fusionrag       # http://localhost:8000
 | `TOP_K` / `CHUNK_TOP_K` | 40 / 20 | 检索广度 |
 | `MAX_GLEANING` | 1 | 补抽轮数 |
 | `DELETE_REBUILD_DESCRIPTIONS` | true | 删除文档时重建存活实体/关系描述 |
-| `KV_BACKEND` | json | KV 后端：`json` / `sqlite` |
+| `KV_BACKEND` | json | KV 后端：`json` / `sqlite` / `postgres` |
+| `STORAGE_BACKEND` / `POSTGRES_DSN` | json / — | 总开关 `postgres`=全家桶（KV+pgvector+AGE）；DSN 例 `postgresql://user:pass@host:5432/db` |
+| `PG_DSN_KV` / `PG_DSN_VECTOR` / `PG_DSN_GRAPH` | 空 | 按类覆盖 DSN，可把三类存储拆到不同 PG 实例 |
 
 完整清单见 [.env.example](.env.example)。
 
@@ -123,9 +134,19 @@ python -m fusionrag       # http://localhost:8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                        # 74 passed, 确定性 Fake LLM/Embedding/Rerank, 无需外部 API
+pytest -q                        # 86 passed, 确定性 Fake LLM/Embedding/Rerank, 无需外部 API
 python scripts/e2e_real.py       # 真实端点端到端验证 (需配置 .env 并启动服务)
 python scripts/verify_delete.py  # 真实端点删除一致性验证
+```
+
+PostgreSQL 后端测试需要真实 PG 实例（无则自动跳过）：
+
+```bash
+docker run -d -e POSTGRES_PASSWORD=postgres -p 15432:5432 pgvector/pgvector:pg16
+docker run -d -e POSTGRES_PASSWORD=postgres -p 15433:5432 apache/age:latest
+PG_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:15432/postgres \
+AGE_TEST_DSN=postgresql://postgres:postgres@127.0.0.1:15433/postgres \
+pytest tests/test_pg_storage.py -v
 ```
 
 用例清单见 [docs/04-自测说明.md](docs/04-自测说明.md)。
