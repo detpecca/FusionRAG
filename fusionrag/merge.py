@@ -5,7 +5,8 @@
 - description: 多片段按 GRAPH_FIELD_SEP(<SEP>) 拼接, 精确去重; 超过 token 阈值
   或片段数过多时调 LLM 摘要压缩
 - source_id: 保序去重合并, 上限截断
-- weight: 仅对未出现过的 source_id 累加, 防止重复插入时重复计数
+- weight: 贡献 chunk 去重计数 (每个新 source_id 记 1), 与删除时按剩余
+  chunk 数重算的口径一致
 - entity_type: 新旧投票取多数
 - 实体向量内容 = "name\\ndescription"; 关系向量内容 = "keywords\\tsrc\\ntgt\\ndescription"
 """
@@ -44,6 +45,11 @@ async def merge_nodes_and_edges(
 
     图谱逐实体/逐关系合并; 向量内容先收集, 最后批量写入向量库,
     避免每个实体/关系各触发一次 embedding 调用 (限流友好)。
+
+    执行顺序: 实体合并 -> 补占位端点 -> 关系合并, 三阶段串行。
+    实体与关系若并发合并, 关系侧的 "has_node 检查 + 补占位节点" 与
+    实体侧的完整节点写入存在 check-then-write 竞态, 空占位可能覆盖
+    已合并的 description/entity_type; 阶段内部各 key 唯一, 可安全并发。
     """
     semaphore = asyncio.Semaphore(config.llm_max_async * 2)
     total = len(nodes) + len(edges)
@@ -64,20 +70,68 @@ async def merge_nodes_and_edges(
     async def _bounded_relation(key: tuple[str, str], records: list[dict]) -> Optional[tuple[str, dict]]:
         async with semaphore:
             result = await _merge_relation(
-                key, records, graph, entity_chunks_kv, relation_chunks_kv, llm, config,
+                key, records, graph, relation_chunks_kv, llm, config,
             )
             _tick()
             return result
 
-    entity_items, relation_items = await asyncio.gather(
-        asyncio.gather(*[_bounded_entity(n, r) for n, r in nodes.items()]),
-        asyncio.gather(*[_bounded_relation(k, r) for k, r in edges.items()]),
+    # 阶段 1: 实体合并 (各实体 key 唯一, 并发安全)
+    entity_items = await asyncio.gather(
+        *[_bounded_entity(n, r) for n, r in nodes.items()]
+    )
+
+    # 阶段 2: 关系端点缺失时补占位节点 (串行, 避免与实体/关系合并竞态)
+    await _ensure_edge_endpoints(edges, graph, entity_chunks_kv, config)
+
+    # 阶段 3: 关系合并 (各关系 key 唯一, 且不再写节点, 并发安全)
+    relation_items = await asyncio.gather(
+        *[_bounded_relation(k, r) for k, r in edges.items()]
     )
 
     # 批量写向量库 (一次 upsert 内部按 embedding_batch_num 分批)
     await entities_vdb.upsert(dict(item for item in entity_items if item))
     await relationships_vdb.upsert(dict(item for item in relation_items if item))
     return {"entities": len(nodes), "relations": len(edges)}
+
+
+async def _ensure_edge_endpoints(
+    edges: dict[tuple[str, str], list[dict]],
+    graph: BaseGraphStorage,
+    entity_chunks_kv: BaseKVStorage,
+    config: FusionRAGConfig,
+) -> None:
+    """为缺失的关系端点补 UNKNOWN 占位节点并登记 chunk 账本。
+
+    必须在实体合并全部完成后串行执行: 若与实体合并并发,
+    "has_node 为假 -> await -> upsert 占位" 的窗口内实体合并可能已写入
+    完整节点, 占位节点的空 description 会将其覆盖 (nx.add_node 更新同名属性)。
+    """
+    # 聚合各端点在本批全部关系记录中的 source_id
+    endpoint_sources: dict[str, list[str]] = {}
+    for (src, tgt), records in edges.items():
+        for endpoint in (src, tgt):
+            endpoint_sources.setdefault(endpoint, []).extend(
+                r["source_id"] for r in records
+            )
+
+    for endpoint, source_ids in endpoint_sources.items():
+        if await graph.has_node(endpoint):
+            continue
+        await graph.upsert_node(
+            endpoint,
+            {
+                "entity_id": endpoint,
+                "entity_type": "unknown",
+                "description": "",
+                "source_id": merge_source_ids(
+                    "", source_ids, GRAPH_FIELD_SEP, config.max_source_ids_per_entity
+                ),
+                "created_at": time.time(),
+            },
+        )
+        ledger = await entity_chunks_kv.get_by_id(endpoint) or {"chunk_ids": []}
+        merged_ids = list(dict.fromkeys(ledger.get("chunk_ids", []) + source_ids))
+        await entity_chunks_kv.upsert({endpoint: {"chunk_ids": merged_ids}})
 
 
 # ---------------------------------------------------------------------------
@@ -194,24 +248,25 @@ async def _merge_relation(
     edge_key: tuple[str, str],
     records: list[dict],
     graph: BaseGraphStorage,
-    entity_chunks_kv: BaseKVStorage,
     relation_chunks_kv: BaseKVStorage,
     llm: LLMService,
     config: FusionRAGConfig,
 ) -> tuple[str, dict]:
-    """合并关系并返回待写入向量库的 (id, payload)。"""
+    """合并关系并返回待写入向量库的 (id, payload)。
+
+    端点节点不在此处创建 (见 _ensure_edge_endpoints), 本函数只写边与账本。
+    """
     src, tgt = sorted(edge_key)  # 无向: 排序后作为存储键
     existing = await graph.get_edge(src, tgt)
     ledger_key = _relation_chunk_key(src, tgt)
     ledger = await relation_chunks_kv.get_by_id(ledger_key) or {"chunk_ids": []}
 
     old_source_ids = set(existing["source_id"].split(GRAPH_FIELD_SEP)) if existing else set()
-    fresh_records = [r for r in records if r["source_id"] not in old_source_ids]
 
-    # weight 只对未出现过的 source_id 累加, 防止重复插入重复计数
-    weight = (existing.get("weight", 0.0) if existing else 0.0) + sum(
-        r.get("weight", 1.0) for r in fresh_records
-    )
+    # weight = 贡献 chunk 去重计数: 每个新 source_id 记 1 (同一 chunk 的多条
+    # 记录不重复计), 与删除时按剩余 chunk 数重算 (len(remaining)) 口径一致
+    new_unique_ids = {r["source_id"] for r in records} - old_source_ids
+    weight = (existing.get("weight", 0.0) if existing else 0.0) + float(len(new_unique_ids))
 
     # keywords: 新旧 union 后字典序逗号连接
     old_keywords = set(existing["keywords"].split(",")) if existing else set()
@@ -240,23 +295,6 @@ async def _merge_relation(
         "source_id": source_id,
         "created_at": existing.get("created_at", time.time()) if existing else time.time(),
     }
-
-    # 缺失端点自动补 UNKNOWN 占位节点
-    for endpoint in (src, tgt):
-        if not await graph.has_node(endpoint):
-            await graph.upsert_node(
-                endpoint,
-                {
-                    "entity_id": endpoint,
-                    "entity_type": "unknown",
-                    "description": "",
-                    "source_id": source_id,
-                    "created_at": time.time(),
-                },
-            )
-            ledger_e = await entity_chunks_kv.get_by_id(endpoint) or {"chunk_ids": []}
-            merged_ids = list(dict.fromkeys(ledger_e.get("chunk_ids", []) + [r["source_id"] for r in records]))
-            await entity_chunks_kv.upsert({endpoint: {"chunk_ids": merged_ids}})
 
     await graph.upsert_edge(src, tgt, edge_data)
 

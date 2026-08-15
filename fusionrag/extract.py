@@ -16,6 +16,7 @@ from .llm import LLMService
 from .prompts import (
     COMPLETION_DELIMITER,
     DEFAULT_ENTITY_TYPES,
+    GRAPH_FIELD_SEP,
     PROMPTS,
     TUPLE_DELIMITER,
 )
@@ -170,7 +171,9 @@ def _handle_entity(
     name: str, entity_type: str, description: str, chunk_key: str
 ) -> Optional[dict]:
     name = sanitize_text(name)
-    if not name or len(name) > 256 or name.isdigit():
+    # GRAPH_FIELD_SEP 是 source_id / 关系账本 key 的内部分隔符,
+    # 实体名混入会破坏账本 key 解析 (删除时 split 解包崩溃), 直接丢弃
+    if not name or len(name) > 256 or name.isdigit() or GRAPH_FIELD_SEP in name:
         return None
     # entity_type 规范化: 小写, 逗号分隔取首个
     entity_type = sanitize_text(entity_type).split(",")[0].strip().lower() or "other"
@@ -189,6 +192,9 @@ def _handle_relation(
     src = sanitize_text(src)
     tgt = sanitize_text(tgt)
     if not src or not tgt or src == tgt:
+        return None
+    # 端点名同实体名规则: 含 GRAPH_FIELD_SEP 保留字的记录丢弃
+    if GRAPH_FIELD_SEP in src or GRAPH_FIELD_SEP in tgt:
         return None
     # 全角逗号转半角
     keywords = sanitize_text(keywords).replace("，", ",")

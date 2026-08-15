@@ -172,6 +172,7 @@ class FusionRAG:
                 }
             )
 
+            chunks: dict[str, dict] = {}  # 失败时按已切分数量记录, 供删除清理
             try:
                 # 1. 切分 (token 滑窗)
                 raw_chunks = chunking_by_token_size(
@@ -244,6 +245,9 @@ class FusionRAG:
                     "relations": stats["relations"],
                 }
             except Exception as e:
+                # FAILED 记录必须保留 chunks_count: 失败前 text_chunks/chunks_vdb
+                # 及部分图数据可能已写入, adelete_by_doc_id 依赖 chunks_count
+                # 重算 chunk id 才能清理这些残留 (否则成为孤儿数据)
                 await self.full_docs.upsert(
                     {
                         doc_id: {
@@ -251,6 +255,13 @@ class FusionRAG:
                             "title": title,
                             "status": "FAILED",
                             "error_msg": str(e),
+                            "content_length": len(text),
+                            # 取本次与历史记录的较大值: 重试在切分前失败时
+                            # 不丢上一次已写入的 chunk 数
+                            "chunks_count": max(
+                                len(chunks), (existing or {}).get("chunks_count", 0)
+                            ),
+                            "created_at": (existing or {}).get("created_at", time.time()),
                             "updated_at": time.time(),
                         }
                     }
