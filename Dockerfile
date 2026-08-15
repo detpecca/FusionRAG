@@ -8,7 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY fusionrag ./fusionrag
 COPY webui ./webui
-COPY pytest.ini .
 
 ENV WORKING_DIR=/app/fusionrag_workspace \
     HOST=0.0.0.0 \
