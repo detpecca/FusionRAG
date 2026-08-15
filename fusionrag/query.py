@@ -215,8 +215,8 @@ async def _chunks_from_sources(
     exclude_ids = exclude_ids or set()
     # 按出现频次保序去重 (频次高的来源优先)
     counts: dict[str, int] = {}
-    for field in source_id_fields:
-        for cid in field.split(GRAPH_FIELD_SEP):
+    for source_field in source_id_fields:
+        for cid in source_field.split(GRAPH_FIELD_SEP):
             if cid and cid not in exclude_ids:
                 counts[cid] = counts.get(cid, 0) + 1
     if not counts:
@@ -464,8 +464,12 @@ async def rag_query(
         ensure_ascii=False,
         indent=2,
     )
+    # chunk 带序号进上下文, 序号与 references 的 reference_id 一一对应,
+    # 供 LLM 输出 [n] 内联角标实现答案溯源
     chunks_str = json.dumps(
-        [{"content": c["content"]} for c in all_chunks], ensure_ascii=False, indent=2
+        [{"id": i + 1, "content": c["content"]} for i, c in enumerate(all_chunks)],
+        ensure_ascii=False,
+        indent=2,
     )
     if param.mode == "naive":
         context = PROMPTS["naive_query_context"].format(text_chunks_str=chunks_str)

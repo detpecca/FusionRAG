@@ -140,6 +140,10 @@ class FusionRAGConfig:
             embedding_api_key=_env("EMBEDDING_API_KEY", ""),
             embedding_base_url=_env("EMBEDDING_BASE_URL", ""),
             embedding_dim=_env_int("EMBEDDING_DIM", cls.embedding_dim),
+            embedding_batch_num=_env_int("EMBEDDING_BATCH_NUM", cls.embedding_batch_num),
+            embedding_max_async=_env_int(
+                "EMBEDDING_MAX_ASYNC", cls.embedding_max_async
+            ),
             rerank_model=_env("RERANK_MODEL", cls.rerank_model),
             rerank_api_key=_env("RERANK_API_KEY", ""),
             rerank_base_url=_env("RERANK_BASE_URL", ""),
@@ -154,9 +158,20 @@ class FusionRAGConfig:
                 "MAX_GLEANING", cls.entity_extract_max_gleaning
             ),
             language=_env("SUMMARY_LANGUAGE", cls.language),
+            summary_max_tokens=_env_int("SUMMARY_MAX_TOKENS", cls.summary_max_tokens),
+            force_llm_summary_on_merge=_env_int(
+                "FORCE_LLM_SUMMARY_ON_MERGE", cls.force_llm_summary_on_merge
+            ),
             top_k=_env_int("TOP_K", cls.top_k),
             chunk_top_k=_env_int("CHUNK_TOP_K", cls.chunk_top_k),
+            max_entity_tokens=_env_int("MAX_ENTITY_TOKENS", cls.max_entity_tokens),
+            max_relation_tokens=_env_int(
+                "MAX_RELATION_TOKENS", cls.max_relation_tokens
+            ),
             max_total_tokens=_env_int("MAX_TOTAL_TOKENS", cls.max_total_tokens),
+            related_chunk_number=_env_int(
+                "RELATED_CHUNK_NUMBER", cls.related_chunk_number
+            ),
             cosine_threshold=_env_float("COSINE_THRESHOLD", cls.cosine_threshold),
             max_history_messages=_env_int(
                 "MAX_HISTORY_MESSAGES", cls.max_history_messages

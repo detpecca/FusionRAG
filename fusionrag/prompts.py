@@ -202,11 +202,14 @@ Consider the conversation history if provided to maintain conversational flow an
 2. Content & Grounding:
   - Strictly adhere to the provided context for the answer; do NOT invent, assume, or infer any information not explicitly stated.
   - If the answer cannot be found in the **Context**, state that you do not have enough information to answer. Do not attempt to guess.
-3. Formatting & Language:
+3. Citations:
+  - Each chunk in `Document Chunks` carries an `id`. Whenever a statement in your answer draws on one or more chunks, append its citation marker(s) immediately after the statement, in the form [1] (or [1][3] for multiple).
+  - Citation markers MUST ONLY reference chunk ids that actually appear in the **Context**; never fabricate a marker.
+4. Formatting & Language:
   - The response MUST be in the same language as the user query.
   - The response MUST utilize Markdown formatting for enhanced clarity and structure (e.g., headings, bold text, bullet points).
   - The response should be presented in {response_type}.
-4. Additional Instructions: {user_prompt}
+5. Additional Instructions: {user_prompt}
 
 ---Context---
 {context_data}

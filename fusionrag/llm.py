@@ -37,6 +37,55 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(exc, (asyncio.TimeoutError, ConnectionError))
 
 
+def _partial_marker_len(text: str, marker: str) -> int:
+    """text 后缀中可能是 marker 不完整前缀的最长长度 (用于流式过滤时暂存尾部)。"""
+    for k in range(min(len(text), len(marker) - 1), 0, -1):
+        if text.endswith(marker[:k]):
+            return k
+    return 0
+
+
+async def _strip_think_stream(
+    chunks: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    """流式版 remove_think_tags: 过滤推理模型的 <think>...</think>。
+
+    标签可能被拆在多个 delta 里, 用缓冲 + 状态机处理:
+    - 未进 think: 暂存可能是 "<think>" 不完整前缀的尾部, 其余立即下发
+    - think 内: 只找 "</think>", 之后恢复下发
+    """
+    OPEN, CLOSE = "<think>", "</think>"
+    buf, in_think = "", False
+    async for delta in chunks:
+        buf += delta
+        while True:
+            if in_think:
+                end = buf.find(CLOSE)
+                if end == -1:
+                    # 丢弃 think 内容, 但保留可能是 "</think>" 前缀的尾部
+                    keep = _partial_marker_len(buf, CLOSE)
+                    buf = buf[len(buf) - keep:] if keep else ""
+                    break
+                buf = buf[end + len(CLOSE):]
+                in_think = False
+            else:
+                start = buf.find(OPEN)
+                if start == -1:
+                    keep = _partial_marker_len(buf, OPEN)
+                    emit = buf[: len(buf) - keep] if keep else buf
+                    if emit:
+                        yield emit
+                    buf = buf[len(buf) - keep:] if keep else ""
+                    break
+                if start > 0:
+                    yield buf[:start]
+                buf = buf[start + len(OPEN):]
+                in_think = True
+    # 流结束: 剩余缓冲 (不含完整标签的残片) 原样下发
+    if buf:
+        yield buf
+
+
 class LLMService:
     """统一的 LLM/Embedding 入口。config.llm_func / embedding_func 可注入自定义实现(测试用)。"""
 
@@ -144,7 +193,8 @@ class LLMService:
         result = await self._retry(_do_call, "LLM chat")
 
         if stream:
-            return result  # type: ignore[return-value]
+            # 流式同样过滤 <think> 标签 (与非流式口径一致)
+            return _strip_think_stream(result)  # type: ignore[arg-type]
 
         content = remove_think_tags(str(result))
         if cache_key is not None and self._cache_kv is not None:

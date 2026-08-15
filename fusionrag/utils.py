@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import logging
 import re
 from typing import Any, Callable, Iterable
 
 import numpy as np
+
+logger = logging.getLogger("fusionrag.utils")
 
 # ---------------------------------------------------------------------------
 # Tokenizer (tiktoken, 失败时退化为按字符估算)
@@ -26,6 +29,12 @@ class Tokenizer:
             self._encoder = tiktoken.encoding_for_model(model_name)
         except Exception:
             self._encoder = None
+            # 退化后 1 字符 = 1 token, 中文场景 chunk 尺寸与 token 预算
+            # 全部失真, 必须显式告警而不是静默继续
+            logger.warning(
+                "tiktoken 不可用, tokenizer 退化为字符级计数 (1 字符 = 1 token), "
+                "chunk 尺寸与 token 预算将偏离设定值; 建议安装 tiktoken"
+            )
 
     def encode(self, text: str) -> list[int]:
         if self._encoder is not None:

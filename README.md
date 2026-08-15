@@ -97,6 +97,11 @@ python -m fusionrag       # http://localhost:8000
 
 字段定义详见 [docs/02-API说明文档.md](docs/02-API说明文档.md)，交互式文档见 `/docs`。
 
+> **部署注意**
+>
+> - **单进程运行**：JSON/SQLite 存储为进程内内存 + 全量落盘，**不支持多进程共享同一工作目录**。请勿使用 `uvicorn --workers 2` 或多容器挂载同一 volume；启动时会用 `instance.lock`（PID 锁文件）检测冲突并拒绝启动，确认无其他实例后删除该文件即可。
+> - **API 鉴权（可选）**：默认无鉴权，仅适合内网/个人使用。设置环境变量 `FUSIONRAG_API_KEY` 后，所有 `/api/*` 端点要求 `Authorization: Bearer <key>` 或 `X-API-Key` 请求头。
+
 ## 配置
 
 全部配置经环境变量注入（`.env`），常用项：

@@ -29,6 +29,46 @@ from .utils import compute_mdhash_id, get_tokenizer
 logger = logging.getLogger("fusionrag")
 
 
+def _pid_alive(pid: int) -> bool:
+    """跨平台检测进程是否存活 (Windows 用 OpenProcess, POSIX 用信号 0)。"""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            SYNCHRONIZE = 0x00100000
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _acquire_instance_lock(working_dir: str) -> None:
+    """单实例锁: 存储是进程内内存 + 全量落盘, 多进程 (如 uvicorn --workers 2)
+    共享同一 working_dir 会静默互相覆盖数据, 用 PID 锁文件把冲突变成显式报错。
+    同一进程重复构造 (测试场景) 允许; PID 复用可能误报, 删除 instance.lock 即可。"""
+    lock_path = os.path.join(working_dir, "instance.lock")
+    holder: Optional[int] = None
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            holder = int(f.read().strip())
+    except (OSError, ValueError):
+        holder = None
+    if holder is not None and holder != os.getpid() and _pid_alive(holder):
+        raise RuntimeError(
+            f"工作目录 {working_dir} 已被进程 {holder} 占用 (instance.lock)。"
+            "JSON 存储不支持多进程共享同一目录; 若确认没有其他实例在运行, "
+            "删除 instance.lock 后重试。"
+        )
+    with open(lock_path, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+
 class FusionRAG:
     """用法::
 
@@ -41,6 +81,7 @@ class FusionRAG:
         self.config = config or FusionRAGConfig.from_env()
         os.makedirs(self.config.working_dir, exist_ok=True)
         wd = self.config.working_dir
+        _acquire_instance_lock(wd)
 
         # KV 存储
         self.full_docs = create_kv_storage("full_docs", wd, self.config)            # 文档原文与状态

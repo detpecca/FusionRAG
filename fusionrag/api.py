@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -68,16 +69,36 @@ def create_app(rag: Optional[FusionRAG] = None) -> FastAPI:
 
     webui_index = Path(__file__).resolve().parent.parent / "webui" / "index.html"
 
+    # 可选 API Key 鉴权: 设置环境变量 FUSIONRAG_API_KEY 后, /api/* 端点
+    # 需要 Authorization: Bearer <key> 或 X-API-Key 头; 未设置则不启用
+    api_key = os.environ.get("FUSIONRAG_API_KEY")
+
+    if api_key:
+        @app.middleware("http")
+        async def check_api_key(request: Request, call_next):
+            if request.url.path.startswith("/api/"):
+                auth = request.headers.get("Authorization", "")
+                token = auth.removeprefix("Bearer ").strip() or request.headers.get(
+                    "X-API-Key", ""
+                )
+                if token != api_key:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"code": 401, "message": "invalid or missing API key", "data": None},
+                    )
+            return await call_next(request)
+
     @app.get("/", include_in_schema=False)
     async def webui():
         return FileResponse(webui_index)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
+        # 内部异常细节只进日志, 不回传客户端 (避免泄漏路径/配置等敏感信息)
         logger.exception("请求处理失败: %s %s", request.method, request.url.path)
         return JSONResponse(
             status_code=500,
-            content={"code": 500, "message": f"internal error: {exc}", "data": None},
+            content={"code": 500, "message": "internal server error", "data": None},
         )
 
     # ---------------------------------------------------------- 文档导入
@@ -240,6 +261,3 @@ def create_app(rag: Optional[FusionRAG] = None) -> FastAPI:
         return _ok({"session_id": session_id, "cleared": cleared})
 
     return app
-
-
-app = create_app()
