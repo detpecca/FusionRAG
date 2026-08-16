@@ -18,9 +18,11 @@ AGE 使用要点 (实现时验证过):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import numpy as np
 
@@ -52,7 +54,8 @@ async def _init_age_conn(conn: Any) -> None:
 
 
 _POOLS: dict[tuple[str, bool], Any] = {}
-_POOLS_LOCK = asyncio.Lock()
+_POOLS_LOCK: Optional[asyncio.Lock] = None
+_POOLS_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
 def _try_import_asyncpg() -> Any:
@@ -86,6 +89,14 @@ async def _ddl(conn: Any, *statements: str) -> None:
 
 
 async def _get_pool(dsn: str, age: bool = False) -> Any:
+    global _POOLS_LOCK, _POOLS_LOOP
+    # asyncio.Lock 与连接都绑定创建时的 event loop; 换 loop (如 pytest 每用例
+    # 新 loop) 时旧池必须已由 close_all_pools 关闭, 这里重置状态重新开始
+    loop = asyncio.get_running_loop()
+    if _POOLS_LOOP is not loop:
+        _POOLS.clear()
+        _POOLS_LOCK = asyncio.Lock()
+        _POOLS_LOOP = loop
     asyncpg = _try_import_asyncpg()
     key = (dsn, age)
     async with _POOLS_LOCK:
@@ -102,10 +113,30 @@ async def _get_pool(dsn: str, age: bool = False) -> Any:
 
 async def close_all_pools() -> None:
     """关闭全部连接池 (测试/优雅退出用)。"""
-    async with _POOLS_LOCK:
+    global _POOLS_LOCK
+    lock = _POOLS_LOCK or asyncio.Lock()
+    async with lock:
         for pool in _POOLS.values():
             await pool.close()
         _POOLS.clear()
+
+
+class _Bindable:
+    """PG 存储公共基类: 支持把存储绑定到一条专用连接 (跨存储单事务用)。"""
+
+    _bound: Any = None
+
+    def _bind(self, conn: Any) -> None:
+        self._bound = conn
+
+    @asynccontextmanager
+    async def _use(self) -> AsyncIterator[Any]:
+        if self._bound is not None:
+            yield self._bound
+        else:
+            pool = await self._pool()
+            async with pool.acquire() as conn:
+                yield conn
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +144,13 @@ async def close_all_pools() -> None:
 # ---------------------------------------------------------------------------
 
 
-class PostgresKVStorage(BaseKVStorage):
+class PostgresKVStorage(BaseKVStorage, _Bindable):
     def __init__(self, namespace: str, dsn: str) -> None:
         self.namespace = namespace
         self._dsn = dsn
         self._table = f"public.kv_{namespace}"
         self._ready = False
+        self._bound: Any = None
 
     async def _pool(self) -> Any:
         return await _get_pool(self._dsn, age=False)
@@ -128,24 +160,25 @@ class PostgresKVStorage(BaseKVStorage):
             await _ddl(
                 conn,
                 f"CREATE TABLE IF NOT EXISTS {self._table} "
-                "(key TEXT PRIMARY KEY, value JSONB NOT NULL)",
+                "(key TEXT PRIMARY KEY, value JSONB NOT NULL, "
+                "stored_at timestamptz NOT NULL DEFAULT now())",
+                # 旧表补列 (stored_at 用于 llm_cache 之类的 TTL 清理)
+                f"ALTER TABLE {self._table} "
+                "ADD COLUMN IF NOT EXISTS stored_at timestamptz NOT NULL DEFAULT now()",
             )
             self._ready = True
 
     async def get_by_id(self, doc_id: str) -> Optional[dict]:
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
-            v = await conn.fetchval(
+            return await conn.fetchval(
                 f"SELECT value FROM {self._table} WHERE key = $1", doc_id
             )
-            return v
 
     async def get_by_ids(self, ids: list[str]) -> list[Optional[dict]]:
         if not ids:
             return []
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             rows = await conn.fetch(
                 f"SELECT key, value FROM {self._table} WHERE key = ANY($1)", ids
@@ -154,8 +187,7 @@ class PostgresKVStorage(BaseKVStorage):
             return [by_key.get(i) for i in ids]
 
     async def keys(self) -> list[str]:
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             rows = await conn.fetch(f"SELECT key FROM {self._table} ORDER BY key")
             return [r["key"] for r in rows]
@@ -163,8 +195,7 @@ class PostgresKVStorage(BaseKVStorage):
     async def filter_keys(self, ids: set[str]) -> set[str]:
         if not ids:
             return set()
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             rows = await conn.fetch(
                 f"SELECT key FROM {self._table} WHERE key = ANY($1)", list(ids)
@@ -175,30 +206,40 @@ class PostgresKVStorage(BaseKVStorage):
     async def upsert(self, data: dict[str, dict]) -> None:
         if not data:
             return
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             async with conn.transaction():
                 # executemany 复用预编译语句, 比逐条 execute 快一个量级
                 await conn.executemany(
-                    f"INSERT INTO {self._table} (key, value) VALUES ($1, $2) "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    f"INSERT INTO {self._table} (key, value, stored_at) "
+                    "VALUES ($1, $2, now()) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+                    "stored_at = now()",
                     [(k, v) for k, v in data.items()],
                 )
 
     async def delete(self, ids: list[str]) -> None:
         if not ids:
             return
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             await conn.execute(
                 f"DELETE FROM {self._table} WHERE key = ANY($1)", ids
             )
 
+    async def delete_older_than(self, days: float) -> int:
+        """删除 stored_at 早于 now()-days 的行, 返回删除数 (llm_cache TTL 用)。"""
+        async with self._use() as conn:
+            await self._ensure_table(conn)
+            status = await conn.execute(
+                f"DELETE FROM {self._table} "
+                "WHERE stored_at < now() - make_interval(days => $1)",
+                days,
+            )
+            return int(status.split()[-1])
+
     async def is_empty(self) -> bool:
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             return not await conn.fetchval(
                 f"SELECT EXISTS (SELECT 1 FROM {self._table})"
@@ -218,7 +259,7 @@ def _parse_vector(text: str) -> list[float]:
     return json.loads(text)
 
 
-class PgvectorStorage(BaseVectorStorage):
+class PgvectorStorage(BaseVectorStorage, _Bindable):
     def __init__(
         self,
         namespace: str,
@@ -232,6 +273,7 @@ class PgvectorStorage(BaseVectorStorage):
         self._dsn = dsn
         self._table = f"public.vdb_{namespace}"
         self._ready = False
+        self._bound: Any = None
 
     async def _pool(self) -> Any:
         return await _get_pool(self._dsn, age=False)
@@ -258,8 +300,7 @@ class PgvectorStorage(BaseVectorStorage):
         ids = list(items.keys())
         contents = [items[i]["content"] for i in ids]
         vectors = await self._embed(contents)
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             async with conn.transaction():
                 await conn.executemany(
@@ -297,8 +338,7 @@ class PgvectorStorage(BaseVectorStorage):
             # <=> 是余弦距离 (0=相同, 2=相反), 相似度阈值转成距离上限
             cond = "WHERE 1 - (embedding <=> $1::vector) >= $3"
             args.append(float(threshold))
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             rows = await conn.fetch(
                 f"SELECT id, content, meta, 1 - (embedding <=> $1::vector) AS score "
@@ -319,16 +359,14 @@ class PgvectorStorage(BaseVectorStorage):
     async def delete(self, ids: list[str]) -> None:
         if not ids:
             return
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             await conn.execute(
                 f"DELETE FROM {self._table} WHERE id = ANY($1)", ids
             )
 
     async def get_by_id(self, doc_id: str) -> Optional[dict]:
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_table(conn)
             r = await conn.fetchrow(
                 f"SELECT content, meta, embedding::text AS vec "
@@ -378,7 +416,7 @@ def _cypher_props(props: dict) -> tuple[str, dict]:
     return sets, dict(props)
 
 
-class AGEGraphStorage(BaseGraphStorage):
+class AGEGraphStorage(BaseGraphStorage, _Bindable):
     _LABEL = "Entity"
     _REL = "REL"
 
@@ -387,6 +425,7 @@ class AGEGraphStorage(BaseGraphStorage):
         self._dsn = dsn
         self._graph = f"fusionrag_{namespace}".replace("-", "_")
         self._ready = False
+        self._bound: Any = None
 
     async def _pool(self) -> Any:
         return await _get_pool(self._dsn, age=True)
@@ -420,20 +459,17 @@ class AGEGraphStorage(BaseGraphStorage):
         self._ready = True
 
     async def _fetch(self, sql: str, *args: Any) -> list[Any]:
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_graph(conn)
             return await conn.fetch(sql, *args)
 
     async def _fetchval(self, sql: str, *args: Any) -> Any:
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_graph(conn)
             return await conn.fetchval(sql, *args)
 
     async def _execute(self, sql: str, *args: Any) -> None:
-        pool = await self._pool()
-        async with pool.acquire() as conn:
+        async with self._use() as conn:
             await self._ensure_graph(conn)
             await conn.execute(sql, *args)
 
@@ -605,3 +641,86 @@ class AGEGraphStorage(BaseGraphStorage):
 
     async def index_done_callback(self) -> None:
         """no-op, 同 PostgresKVStorage。"""
+
+
+# ---------------------------------------------------------------------------
+# 跨存储单事务: 把多个 PG 存储绑定到同一条连接, all-or-nothing 提交/回滚
+# ---------------------------------------------------------------------------
+
+
+class PgMultiStorageTransaction:
+    """用法::
+
+        async with PgMultiStorageTransaction([rag.full_docs, rag.text_chunks, ...]):
+            ...  # 期间所有存储的读写走同一条连接、同一个事务
+
+    要求参与存储的 DSN 一致 (单实例全家桶); 任一环节抛异常则整体回滚。
+    注意: 事务内不应有长耗时外部调用 (LLM 重建走缓存时很快, 可接受)。
+    """
+
+    def __init__(self, storages: list[_Bindable]) -> None:
+        self._storages = storages
+        self._conn: Any = None
+        self._tx: Any = None
+
+    async def __aenter__(self) -> "PgMultiStorageTransaction":
+        asyncpg = _try_import_asyncpg()
+        dsns = {getattr(s, "_dsn", None) for s in self._storages}
+        if len(dsns) != 1 or None in dsns:
+            raise ValueError("跨存储事务要求全部存储使用同一 POSTGRES_DSN")
+        self._conn = await asyncpg.connect(dsns.pop())
+        # AGE 连接初始化对 kv/vector 无害: SQL 均带 schema 前缀
+        await _init_age_conn(self._conn)
+        self._tx = self._conn.transaction()
+        await self._tx.start()
+        for st in self._storages:
+            st._bind(self._conn)
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        for st in self._storages:
+            st._bind(None)
+        try:
+            if exc_type is None:
+                await self._tx.commit()
+            else:
+                await self._tx.rollback()
+        finally:
+            await self._conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 文档级跨进程锁: 专用连接上的会话级咨询锁
+# ---------------------------------------------------------------------------
+
+
+def doc_lock_key(doc_id: str) -> int:
+    """文档 id -> 有符号 bigint 咨询锁键 (与 PG 端 pg_locks 可对照验证)。"""
+    return int.from_bytes(
+        hashlib.md5(("fusionrag:doc:" + doc_id).encode()).digest()[:8],
+        "big", signed=True,
+    )
+
+
+async def acquire_doc_lock(dsn: str, doc_id: str) -> Any:
+    """阻塞获取文档级跨进程锁, 返回持锁连接; 用 release_doc_lock 释放。
+
+    进程内并发由 asyncio 锁串行化, 这把锁补的是跨进程/多 worker:
+    同一 doc_id 的并发导入, 后到者在 PG 侧排队, 醒来后看到 PROCESSED
+    即走幂等跳过, 避免重复跑 LLM 流水线。
+    """
+    asyncpg = _try_import_asyncpg()
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute("SELECT pg_advisory_lock($1)", doc_lock_key(doc_id))
+        return conn
+    except Exception:
+        await conn.close()
+        raise
+
+
+async def release_doc_lock(conn: Any, doc_id: str) -> None:
+    try:
+        await conn.execute("SELECT pg_advisory_unlock($1)", doc_lock_key(doc_id))
+    finally:
+        await conn.close()

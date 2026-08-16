@@ -1,4 +1,4 @@
-# FusionRAG —— 图增强检索生成（GraphRAG）企业知识库问答系统
+﻿# FusionRAG —— 图增强检索生成（GraphRAG）企业知识库问答系统
 
 把企业文档变成**可检索、可溯源、可治理**的知识：在向量检索之上构建实体/关系知识图谱，
 以三路混合检索 + rerank 精排定位证据，让 LLM 严格基于上下文作答，并为每个答案附上引用来源。
@@ -96,7 +96,8 @@ docker compose -f docker-compose.pg.yml up -d   # 一键起 AGE+pgvector 合一�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/v1/document/import` | 导入文档（文本） |
+| POST | `/api/v1/document/import` | 导入文档（文本）；`"wait": false` 时立即返回、后台执行 |
+| GET | `/api/v1/document/{doc_id}` | 查询文档导入状态（异步导入的轮询端点） |
 | POST | `/api/v1/document/import-file` | 上传 .md/.txt 文件（SSE 进度） |
 | GET | `/api/v1/documents` | 文档列表 |
 | DELETE | `/api/v1/document/{doc_id}` | 删除文档（图谱一致性维护） |
@@ -108,7 +109,8 @@ docker compose -f docker-compose.pg.yml up -d   # 一键起 AGE+pgvector 合一�
 
 > **部署注意**
 >
-> - **单进程运行（JSON/SQLite 后端）**：文件型存储为进程内内存 + 全量落盘，**不支持多进程共享同一工作目录**。请勿使用 `uvicorn --workers 2` 或多容器挂载同一 volume；启动时会用 `instance.lock`（PID 锁文件）检测冲突并拒绝启动，确认无其他实例后删除该文件即可。使用 `STORAGE_BACKEND=postgres` 全家桶时无此限制（MVCC + 行锁，多 worker 安全，自动跳过该锁）。
+> - **单进程运行（含文件型后端时）**：只要 KV/向量/图任一后端是文件型（json/sqlite），多进程共享同一工作目录就会互相覆盖，**不支持多 worker**。启动时会用 `instance.lock`（PID 锁文件）检测冲突并拒绝启动，确认无其他实例后删除该文件即可。
+> - **PG 全家桶多 worker**：`STORAGE_BACKEND=postgres` 时无上述限制——数据层由 MVCC+行锁保证安全，导入/删除还带文档级跨进程咨询锁（同一 `doc_id` 的并发请求在 PG 侧排队，不重复跑 LLM 流水线）；删除全程包在单事务中，失败整体回滚不留半删状态。
 > - **API 鉴权（可选）**：默认无鉴权，仅适合内网/个人使用。设置环境变量 `FUSIONRAG_API_KEY` 后，所有 `/api/*` 端点要求 `Authorization: Bearer <key>` 或 `X-API-Key` 请求头。
 
 ## 配置
@@ -124,6 +126,7 @@ docker compose -f docker-compose.pg.yml up -d   # 一键起 AGE+pgvector 合一�
 | `TOP_K` / `CHUNK_TOP_K` | 40 / 20 | 检索广度 |
 | `MAX_GLEANING` | 1 | 补抽轮数 |
 | `DELETE_REBUILD_DESCRIPTIONS` | true | 删除文档时重建存活实体/关系描述 |
+| `LLM_CACHE_TTL_DAYS` | 30 | LLM 缓存保留天数（仅 PG KV 后端生效；0=永不过期） |
 | `KV_BACKEND` | json | KV 后端：`json` / `sqlite` / `postgres` |
 | `STORAGE_BACKEND` / `POSTGRES_DSN` | json / — | 总开关 `postgres`=全家桶（KV+pgvector+AGE）；DSN 例 `postgresql://user:pass@host:5432/db` |
 | `PG_DSN_KV` / `PG_DSN_VECTOR` / `PG_DSN_GRAPH` | 空 | 按类覆盖 DSN，可把三类存储拆到不同 PG 实例 |
@@ -134,7 +137,8 @@ docker compose -f docker-compose.pg.yml up -d   # 一键起 AGE+pgvector 合一�
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                        # 86 passed, 确定性 Fake LLM/Embedding/Rerank, 无需外部 API
+pytest -q                        # 76 passed, 确定性 Fake LLM/Embedding/Rerank, 无需外部 API
+                                  # (另有 15 条 PG 用例, 配置 PG_TEST_DSN/AGE_TEST_DSN 后运行)
 python scripts/e2e_real.py       # 真实端点端到端验证 (需配置 .env 并启动服务)
 python scripts/verify_delete.py  # 真实端点删除一致性验证
 ```

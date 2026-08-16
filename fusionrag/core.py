@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
 from .chunking import chunking_by_token_size
@@ -23,6 +24,11 @@ from .storage import (
     create_graph_storage,
     create_kv_storage,
     create_vector_storage,
+)
+from .storage_pg import (
+    PgMultiStorageTransaction,
+    acquire_doc_lock,
+    release_doc_lock,
 )
 from .utils import compute_mdhash_id, get_tokenizer
 
@@ -81,12 +87,12 @@ class FusionRAG:
         self.config = config or FusionRAGConfig.from_env()
         os.makedirs(self.config.working_dir, exist_ok=True)
         wd = self.config.working_dir
-        # 单实例锁只保护文件型后端 (json/sqlite 的"进程内存+落盘"模型);
-        # PostgreSQL 系后端 (postgres/pgvector/age) 由 MVCC+行锁保证多进程安全
+        # 单实例锁保护文件型后端 (json/sqlite 的"进程内存+落盘"模型):
+        # 只要任一存储是文件型, 多进程共享 working_dir 就会互相覆盖
         file_backends = (
             self.config.resolve_kv_backend() in ("json", "sqlite")
-            and self.config.resolve_vector_backend() == "json"
-            and self.config.resolve_graph_backend() == "json"
+            or self.config.resolve_vector_backend() == "json"
+            or self.config.resolve_graph_backend() == "json"
         )
         if file_backends:
             _acquire_instance_lock(wd)
@@ -127,6 +133,44 @@ class FusionRAG:
 
         self._insert_lock = asyncio.Lock()
         self.tokenizer = get_tokenizer()
+
+        # PG 全家桶 (单实例同 DSN) 时的跨进程协调:
+        # - 文档级咨询锁: 多 worker 同时导入/删除同一 doc_id 时避免重复跑流水线
+        # - 跨存储单事务: adelete 的全部存储操作 all-or-nothing
+        # 后端名与工厂映射规则一致: 总开关 postgres 在向量/图类分别映射为
+        # pgvector / age
+        self._full_pg = (
+            self.config.resolve_kv_backend() == "postgres"
+            and self.config.resolve_vector_backend() in ("pgvector", "postgres")
+            and self.config.resolve_graph_backend() in ("age", "postgres")
+        )
+        self._doc_lock_dsn = (
+            self.config.resolve_pg_dsn("kv") if self._full_pg else None
+        )
+        same_dsn = self._full_pg and (
+            self.config.resolve_pg_dsn("kv")
+            == self.config.resolve_pg_dsn("vector")
+            == self.config.resolve_pg_dsn("graph")
+        )
+        self._tx_storages = (
+            [
+                self.full_docs, self.text_chunks, self.entity_chunks,
+                self.relation_chunks, self.chunks_vdb, self.entities_vdb,
+                self.relationships_vdb, self.graph,
+            ]
+            if same_dsn
+            else None
+        )
+
+    @asynccontextmanager
+    async def _atomic_tx(self):
+        """删除等关键段的事务上下文: 全 PG 单实例时绑定全部存储到单事务,
+        否则 (文件后端/混合后端/拆分实例) 退化为逐存储各自操作。"""
+        if self._tx_storages is None:
+            yield None
+            return
+        async with PgMultiStorageTransaction(self._tx_storages):
+            yield
 
     def _check_embedding_fingerprint(self, working_dir: str) -> None:
         """校验 embedding 模型/维度与存量向量是否一致, 防静默数据损坏。
@@ -196,127 +240,138 @@ class FusionRAG:
             title = first_line[:40] or doc_id
         notify = progress_callback or (lambda stage, cur, total: None)
 
-        async with self._insert_lock:  # 串行化导入, 简化并发合并冲突
-            existing = await self.full_docs.get_by_id(doc_id)
-            if existing and existing.get("status") == "PROCESSED":
-                logger.info("文档 %s 已存在, 跳过", doc_id)
-                return {
-                    "doc_id": doc_id,
-                    "status": "SKIPPED",
-                    "chunks": existing.get("chunks_count", 0),
-                    "entities": 0,
-                    "relations": 0,
-                }
-
-            await self.full_docs.upsert(
-                {
-                    doc_id: {
-                        "content": text,
-                        "title": title,
-                        "status": "PROCESSING",
-                        "content_length": len(text),
-                        "created_at": time.time(),
-                        "updated_at": time.time(),
+        # 文档级跨进程锁 (PG 全家桶): 多 worker 同时导入同一 doc_id 时,
+        # 后到者在 PG 侧排队, 醒来后走幂等跳过, 不重复跑 LLM 流水线
+        doc_lock = (
+            await acquire_doc_lock(self._doc_lock_dsn, doc_id)
+            if self._doc_lock_dsn
+            else None
+        )
+        try:
+            async with self._insert_lock:  # 串行化导入, 简化并发合并冲突
+                existing = await self.full_docs.get_by_id(doc_id)
+                if existing and existing.get("status") == "PROCESSED":
+                    logger.info("文档 %s 已存在, 跳过", doc_id)
+                    return {
+                        "doc_id": doc_id,
+                        "status": "SKIPPED",
+                        "chunks": existing.get("chunks_count", 0),
+                        "entities": 0,
+                        "relations": 0,
                     }
-                }
-            )
 
-            chunks: dict[str, dict] = {}  # 失败时按已切分数量记录, 供删除清理
-            try:
-                # 1. 切分 (token 滑窗)
-                raw_chunks = chunking_by_token_size(
-                    text,
-                    self.tokenizer,
-                    self.config.chunk_token_size,
-                    self.config.chunk_overlap_token_size,
-                )
-                chunks = {
-                    compute_mdhash_id(f"{doc_id}-{c['chunk_order_index']}", prefix="chunk-"): {
-                        **c,
-                        "full_doc_id": doc_id,
-                    }
-                    for c in raw_chunks
-                }
-                notify("chunked", len(chunks), len(chunks))
-
-                # 2. chunk 原文入 KV, 内容入向量库
-                await self.text_chunks.upsert(chunks)
-                await self.chunks_vdb.upsert(
-                    {
-                        key: {"content": c["content"], "meta": {"full_doc_id": doc_id}}
-                        for key, c in chunks.items()
-                    }
-                )
-                notify("vectorized", len(chunks), len(chunks))
-
-                # 3. 实体/关系抽取 (含 gleaning 补抽), 逐 chunk 汇报进度
-                nodes, edges = await extract_entities(
-                    chunks, self.llm, self.config, progress_callback=notify
-                )
-
-                # 4. 去重合并: 写图谱 + 实体/关系向量库
-                stats = await merge_nodes_and_edges(
-                    nodes,
-                    edges,
-                    self.graph,
-                    self.entities_vdb,
-                    self.relationships_vdb,
-                    self.entity_chunks,
-                    self.relation_chunks,
-                    self.llm,
-                    self.config,
-                    progress_callback=notify,
-                )
-                notify("finalizing", 1, 1)
-
-                # 5. 状态落库 + 全部 flush
                 await self.full_docs.upsert(
                     {
                         doc_id: {
                             "content": text,
                             "title": title,
-                            "status": "PROCESSED",
+                            "status": "PROCESSING",
                             "content_length": len(text),
-                            "chunks_count": len(chunks),
-                            "entities_count": stats["entities"],
-                            "relations_count": stats["relations"],
                             "created_at": time.time(),
                             "updated_at": time.time(),
                         }
                     }
                 )
-                await self._flush()
-                return {
-                    "doc_id": doc_id,
-                    "status": "PROCESSED",
-                    "chunks": len(chunks),
-                    "entities": stats["entities"],
-                    "relations": stats["relations"],
-                }
-            except Exception as e:
-                # FAILED 记录必须保留 chunks_count: 失败前 text_chunks/chunks_vdb
-                # 及部分图数据可能已写入, adelete_by_doc_id 依赖 chunks_count
-                # 重算 chunk id 才能清理这些残留 (否则成为孤儿数据)
-                await self.full_docs.upsert(
-                    {
-                        doc_id: {
-                            "content": text,
-                            "title": title,
-                            "status": "FAILED",
-                            "error_msg": str(e),
-                            "content_length": len(text),
-                            # 取本次与历史记录的较大值: 重试在切分前失败时
-                            # 不丢上一次已写入的 chunk 数
-                            "chunks_count": max(
-                                len(chunks), (existing or {}).get("chunks_count", 0)
-                            ),
-                            "created_at": (existing or {}).get("created_at", time.time()),
-                            "updated_at": time.time(),
+
+                chunks: dict[str, dict] = {}  # 失败时按已切分数量记录, 供删除清理
+                try:
+                    # 1. 切分 (token 滑窗)
+                    raw_chunks = chunking_by_token_size(
+                        text,
+                        self.tokenizer,
+                        self.config.chunk_token_size,
+                        self.config.chunk_overlap_token_size,
+                    )
+                    chunks = {
+                        compute_mdhash_id(f"{doc_id}-{c['chunk_order_index']}", prefix="chunk-"): {
+                            **c,
+                            "full_doc_id": doc_id,
                         }
+                        for c in raw_chunks
                     }
-                )
-                await self._flush()
-                raise
+                    notify("chunked", len(chunks), len(chunks))
+
+                    # 2. chunk 原文入 KV, 内容入向量库
+                    await self.text_chunks.upsert(chunks)
+                    await self.chunks_vdb.upsert(
+                        {
+                            key: {"content": c["content"], "meta": {"full_doc_id": doc_id}}
+                            for key, c in chunks.items()
+                        }
+                    )
+                    notify("vectorized", len(chunks), len(chunks))
+
+                    # 3. 实体/关系抽取 (含 gleaning 补抽), 逐 chunk 汇报进度
+                    nodes, edges = await extract_entities(
+                        chunks, self.llm, self.config, progress_callback=notify
+                    )
+
+                    # 4. 去重合并: 写图谱 + 实体/关系向量库
+                    stats = await merge_nodes_and_edges(
+                        nodes,
+                        edges,
+                        self.graph,
+                        self.entities_vdb,
+                        self.relationships_vdb,
+                        self.entity_chunks,
+                        self.relation_chunks,
+                        self.llm,
+                        self.config,
+                        progress_callback=notify,
+                    )
+                    notify("finalizing", 1, 1)
+
+                    # 5. 状态落库 + 全部 flush
+                    await self.full_docs.upsert(
+                        {
+                            doc_id: {
+                                "content": text,
+                                "title": title,
+                                "status": "PROCESSED",
+                                "content_length": len(text),
+                                "chunks_count": len(chunks),
+                                "entities_count": stats["entities"],
+                                "relations_count": stats["relations"],
+                                "created_at": time.time(),
+                                "updated_at": time.time(),
+                            }
+                        }
+                    )
+                    await self._flush()
+                    return {
+                        "doc_id": doc_id,
+                        "status": "PROCESSED",
+                        "chunks": len(chunks),
+                        "entities": stats["entities"],
+                        "relations": stats["relations"],
+                    }
+                except Exception as e:
+                    # FAILED 记录必须保留 chunks_count: 失败前 text_chunks/chunks_vdb
+                    # 及部分图数据可能已写入, adelete_by_doc_id 依赖 chunks_count
+                    # 重算 chunk id 才能清理这些残留 (否则成为孤儿数据)
+                    await self.full_docs.upsert(
+                        {
+                            doc_id: {
+                                "content": text,
+                                "title": title,
+                                "status": "FAILED",
+                                "error_msg": str(e),
+                                "content_length": len(text),
+                                # 取本次与历史记录的较大值: 重试在切分前失败时
+                                # 不丢上一次已写入的 chunk 数
+                                "chunks_count": max(
+                                    len(chunks), (existing or {}).get("chunks_count", 0)
+                                ),
+                                "created_at": (existing or {}).get("created_at", time.time()),
+                                "updated_at": time.time(),
+                            }
+                        }
+                    )
+                    await self._flush()
+                    raise
+        finally:
+            if doc_lock is not None:
+                await release_doc_lock(doc_lock, doc_id)
 
     async def alist_documents(self) -> list[dict]:
         """列出全部已导入文档 (不含原文), 按创建时间倒序。"""
@@ -361,90 +416,105 @@ class FusionRAG:
           source_id/weight (兜底模式, 保留原描述)。
         LLM 缓存不删 (重导入/删除重建均可复用抽取结果)。
         本操作幂等: 扣减是 no-op, 失败后重发同一请求即可续删。
+        PG 全家桶下全程包在单事务中: 任一环节失败整体回滚, 不留半删状态
+        (文件后端无事务, 语义退化为逐存储各自操作)。
         """
-        async with self._insert_lock:  # 与导入互斥
-            record = await self.full_docs.get_by_id(doc_id)
-            if not record:
-                raise KeyError(f"文档不存在: {doc_id}")
-            chunks_count = record.get("chunks_count", 0)
-            # chunk key 是确定性的, 按序号重算 (无需存储 chunks_list)
-            chunk_ids = [
-                compute_mdhash_id(f"{doc_id}-{i}", prefix="chunk-")
-                for i in range(chunks_count)
-            ]
-            chunk_id_set = set(chunk_ids)
-            stats = {
-                "doc_id": doc_id,
-                "status": "DELETED",
-                "chunks_deleted": len(chunk_ids),
-                "entities_deleted": 0,
-                "entities_updated": 0,
-                "entities_rebuilt": 0,
-                "relations_deleted": 0,
-                "relations_updated": 0,
-                "relations_rebuilt": 0,
-            }
-            updated_entities: list[tuple[str, list[str]]] = []   # (name, remaining_chunk_ids)
-            updated_relations: list[tuple[str, str, list[str]]] = []  # (src, tgt, remaining)
+        doc_lock = (
+            await acquire_doc_lock(self._doc_lock_dsn, doc_id)
+            if self._doc_lock_dsn
+            else None
+        )
+        try:
+            async with self._insert_lock:  # 与导入互斥
+                async with self._atomic_tx():
+                    return await self._adelete_locked(doc_id)
+        finally:
+            if doc_lock is not None:
+                await release_doc_lock(doc_lock, doc_id)
 
-            # 1. 实体裁决 (候选 = 账本与本文档 chunk 有交集的实体;
-            #    本地 JSON 规模全量扫描可接受, 规模化时可换专用的实体→文档索引)
-            entity_keys = await self.entity_chunks.keys()
-            entity_ledgers = await self.entity_chunks.get_by_ids(entity_keys)
-            for name, ledger in zip(entity_keys, entity_ledgers):
-                old_ids = (ledger or {}).get("chunk_ids", [])
-                if not chunk_id_set.intersection(old_ids):
-                    continue
-                remaining = [c for c in old_ids if c not in chunk_id_set]
-                if not remaining:
-                    await self._delete_entity(name, stats)
-                else:
-                    await self.entity_chunks.upsert({name: {"chunk_ids": remaining}})
-                    node = await self.graph.get_node(name)
-                    if node:
-                        node["source_id"] = GRAPH_FIELD_SEP.join(remaining)
-                        await self.graph.upsert_node(name, node)
-                    updated_entities.append((name, remaining))
-                    stats["entities_updated"] += 1
+    async def _adelete_locked(self, doc_id: str) -> dict:
+        record = await self.full_docs.get_by_id(doc_id)
+        if not record:
+            raise KeyError(f"文档不存在: {doc_id}")
+        chunks_count = record.get("chunks_count", 0)
+        # chunk key 是确定性的, 按序号重算 (无需存储 chunks_list)
+        chunk_ids = [
+            compute_mdhash_id(f"{doc_id}-{i}", prefix="chunk-")
+            for i in range(chunks_count)
+        ]
+        chunk_id_set = set(chunk_ids)
+        stats = {
+            "doc_id": doc_id,
+            "status": "DELETED",
+            "chunks_deleted": len(chunk_ids),
+            "entities_deleted": 0,
+            "entities_updated": 0,
+            "entities_rebuilt": 0,
+            "relations_deleted": 0,
+            "relations_updated": 0,
+            "relations_rebuilt": 0,
+        }
+        updated_entities: list[tuple[str, list[str]]] = []   # (name, remaining_chunk_ids)
+        updated_relations: list[tuple[str, str, list[str]]] = []  # (src, tgt, remaining)
 
-            # 2. 关系裁决 (在实体之后: 被删实体的残留边已在上面连带清理)
-            rel_keys = await self.relation_chunks.keys()
-            rel_ledgers = await self.relation_chunks.get_by_ids(rel_keys)
-            for key, ledger in zip(rel_keys, rel_ledgers):
-                old_ids = (ledger or {}).get("chunk_ids", [])
-                if not chunk_id_set.intersection(old_ids):
-                    continue
-                remaining = [c for c in old_ids if c not in chunk_id_set]
-                src, tgt = key.split(GRAPH_FIELD_SEP)
-                if not remaining:
-                    await self._delete_relation(src, tgt, stats)
-                else:
-                    await self.relation_chunks.upsert({key: {"chunk_ids": remaining}})
-                    edge = await self.graph.get_edge(src, tgt)
-                    if edge:
-                        edge["source_id"] = GRAPH_FIELD_SEP.join(remaining)
-                        edge["weight"] = float(len(remaining))  # 重算计数
-                        await self.graph.upsert_edge(src, tgt, edge)
-                    updated_relations.append((src, tgt, remaining))
-                    stats["relations_updated"] += 1
+        # 1. 实体裁决 (候选 = 账本与本文档 chunk 有交集的实体;
+        #    本地 JSON 规模全量扫描可接受, 规模化时可换专用的实体→文档索引)
+        entity_keys = await self.entity_chunks.keys()
+        entity_ledgers = await self.entity_chunks.get_by_ids(entity_keys)
+        for name, ledger in zip(entity_keys, entity_ledgers):
+            old_ids = (ledger or {}).get("chunk_ids", [])
+            if not chunk_id_set.intersection(old_ids):
+                continue
+            remaining = [c for c in old_ids if c not in chunk_id_set]
+            if not remaining:
+                await self._delete_entity(name, stats)
+            else:
+                await self.entity_chunks.upsert({name: {"chunk_ids": remaining}})
+                node = await self.graph.get_node(name)
+                if node:
+                    node["source_id"] = GRAPH_FIELD_SEP.join(remaining)
+                    await self.graph.upsert_node(name, node)
+                updated_entities.append((name, remaining))
+                stats["entities_updated"] += 1
 
-            # 3. 描述重建: 存活实体/关系用剩余 chunk 重抽(LLM 缓存命中)并重合并
-            if self.config.delete_rebuild_descriptions and (
-                updated_entities or updated_relations
-            ):
-                await self._rebuild_surviving_descriptions(
-                    updated_entities, updated_relations, stats
-                )
+        # 2. 关系裁决 (在实体之后: 被删实体的残留边已在上面连带清理)
+        rel_keys = await self.relation_chunks.keys()
+        rel_ledgers = await self.relation_chunks.get_by_ids(rel_keys)
+        for key, ledger in zip(rel_keys, rel_ledgers):
+            old_ids = (ledger or {}).get("chunk_ids", [])
+            if not chunk_id_set.intersection(old_ids):
+                continue
+            remaining = [c for c in old_ids if c not in chunk_id_set]
+            src, tgt = key.split(GRAPH_FIELD_SEP)
+            if not remaining:
+                await self._delete_relation(src, tgt, stats)
+            else:
+                await self.relation_chunks.upsert({key: {"chunk_ids": remaining}})
+                edge = await self.graph.get_edge(src, tgt)
+                if edge:
+                    edge["source_id"] = GRAPH_FIELD_SEP.join(remaining)
+                    edge["weight"] = float(len(remaining))  # 重算计数
+                    await self.graph.upsert_edge(src, tgt, edge)
+                updated_relations.append((src, tgt, remaining))
+                stats["relations_updated"] += 1
 
-            # 4. 删 chunk 原文与向量
-            await self.chunks_vdb.delete(chunk_ids)
-            await self.text_chunks.delete(chunk_ids)
+        # 3. 描述重建: 存活实体/关系用剩余 chunk 重抽(LLM 缓存命中)并重合并
+        if self.config.delete_rebuild_descriptions and (
+            updated_entities or updated_relations
+        ):
+            await self._rebuild_surviving_descriptions(
+                updated_entities, updated_relations, stats
+            )
 
-            # 5. 删文档记录并落盘
-            await self.full_docs.delete([doc_id])
-            await self._flush()
-            logger.info("文档 %s 已删除: %s", doc_id, stats)
-            return stats
+        # 4. 删 chunk 原文与向量
+        await self.chunks_vdb.delete(chunk_ids)
+        await self.text_chunks.delete(chunk_ids)
+
+        # 5. 删文档记录并落盘
+        await self.full_docs.delete([doc_id])
+        await self._flush()
+        logger.info("文档 %s 已删除: %s", doc_id, stats)
+        return stats
 
     async def _delete_entity(self, name: str, stats: dict) -> None:
         """真删实体: 先连带清理残留边, 再删图节点/实体向量/账本。"""

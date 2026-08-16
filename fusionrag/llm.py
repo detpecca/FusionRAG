@@ -205,7 +205,27 @@ class LLMService:
             if self._cache_dirty >= self.CACHE_FLUSH_EVERY:
                 await self._cache_kv.index_done_callback()
                 self._cache_dirty = 0
+                await self._evict_stale_cache()
         return content
+
+    async def _evict_stale_cache(self) -> None:
+        """TTL 清理 (仅 PG KV 后端支持 delete_older_than; JSON 后端无此方法跳过)。
+
+        挂在节流落盘边界上执行, 频率约为每 32 次缓存写入一次, 无需单独定时器。
+        """
+        ttl = self.config.llm_cache_ttl_days
+        if ttl <= 0:
+            return
+        evict = getattr(self._cache_kv, "delete_older_than", None)
+        if evict is None:
+            return
+        try:
+            n = await evict(ttl)
+            if n:
+                logger.info("LLM 缓存 TTL 清理: 删除 %d 条 (>%s 天)", n, ttl)
+        except Exception:
+            # 清理失败不影响主流程, 下个边界重试
+            logger.warning("LLM 缓存 TTL 清理失败", exc_info=True)
 
     async def _openai_chat(
         self, messages: list[dict], stream: bool, max_tokens: Optional[int]

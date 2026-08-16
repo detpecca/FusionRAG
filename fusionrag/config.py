@@ -61,6 +61,10 @@ class FusionRAGConfig:
     def resolve_graph_backend(self) -> str:
         return self.graph_backend or self.storage_backend or "json"
 
+    def resolve_pg_dsn(self, kind: str) -> str:
+        """按类取 PG 连接串 (pg_dsn_kv/vector/graph > postgres_dsn), 缺失返回空串。"""
+        return getattr(self, f"pg_dsn_{kind}", "") or self.postgres_dsn
+
     # ---- LLM (OpenAI 兼容接口) ----
     llm_model: str = "gpt-4o-mini"
     llm_api_key: str = ""
@@ -69,6 +73,7 @@ class FusionRAGConfig:
     llm_timeout: float = 240.0
     llm_temperature: float | None = None   # None = 不传给服务端 (部分模型如 Kimi 仅允许 temperature=1)
     enable_llm_cache: bool = True     # 抽取/摘要结果缓存, 重跑文档时省钱省时
+    llm_cache_ttl_days: float = 30.0  # 缓存保留天数 (仅 PG KV 后端生效; 0=永不过期)
     llm_max_retries: int = 5          # 429/5xx/连接错误的最大重试次数
     retry_base_delay: float = 2.0     # 指数退避基数(秒), 实际等待 = base * 2^attempt + 抖动
 
@@ -147,6 +152,7 @@ class FusionRAGConfig:
             llm_max_retries=_env_int("LLM_MAX_RETRIES", cls.llm_max_retries),
             retry_base_delay=_env_float("RETRY_BASE_DELAY", cls.retry_base_delay),
             enable_llm_cache=_env("ENABLE_LLM_CACHE", "true").lower() == "true",
+            llm_cache_ttl_days=_env_float("LLM_CACHE_TTL_DAYS", cls.llm_cache_ttl_days),
             embedding_model=_env("EMBEDDING_MODEL", cls.embedding_model),
             embedding_api_key=_env("EMBEDDING_API_KEY", ""),
             embedding_base_url=_env("EMBEDDING_BASE_URL", ""),

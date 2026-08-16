@@ -163,3 +163,60 @@ def test_document_delete(test_config):
     # 重复删除: 404
     resp = client.delete(f"/api/v1/document/{doc_id}")
     assert resp.status_code == 404
+
+
+def test_async_import_and_status_polling(test_config):
+    """wait=false 立即返回 PROCESSING, 后台完成, GET 状态端点可轮询到 PROCESSED。
+
+    必须用 context manager 形式的 TestClient: 非 with 用法下每个请求独占一个
+    事件循环, 请求结束 loop 即关闭, 后台导入任务会被一并丢弃。
+    """
+    import time
+
+    with TestClient(create_app(FusionRAG(test_config))) as client:
+        resp = client.post(
+            "/api/v1/document/import", json={"document": SAMPLE_DOC, "wait": False}
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["status"] == "PROCESSING" and data["async"] is True
+        doc_id = data["doc_id"]
+
+        status = None
+        for _ in range(50):  # 最多等 5s
+            rec = client.get(f"/api/v1/document/{doc_id}").json()["data"]
+            status = rec["status"]
+            if status == "PROCESSED":
+                break
+            time.sleep(0.1)
+        assert status == "PROCESSED"
+        assert rec["chunks"] >= 1
+
+        # 未知文档 404
+        assert client.get("/api/v1/document/doc-not-exist").status_code == 404
+
+
+def test_stream_disconnect_still_records_history(test_config):
+    """流式对话客户端中途断开, 已生成的部分答案仍应落入会话历史。"""
+    client = _client(test_config)
+    client.post("/api/v1/document/import", json={"document": SAMPLE_DOC})
+
+    with client.stream(
+        "POST",
+        "/api/v1/chat/completions",
+        json={"session_id": "s9", "message": "星尘科技是什么?", "stream": True},
+    ) as resp:
+        for line in resp.iter_lines():
+            if "delta" in line:
+                break  # 收到第一个 delta 就断开, 模拟客户端断连
+
+    # 后台生成器 aclose -> finally 落历史
+    import time
+    for _ in range(30):
+        messages = client.get("/api/v1/chat/history/s9").json()["data"]["messages"]
+        if messages:
+            break
+        time.sleep(0.1)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "user" and messages[0]["content"] == "星尘科技是什么?"
+    assert messages[1]["role"] == "assistant" and messages[1]["content"]

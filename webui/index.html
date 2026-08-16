@@ -289,6 +289,16 @@
     display: inline-block; min-width: 16px; text-align: center; font-size: 11px;
     background: var(--accent-soft); color: var(--accent); border-radius: 5px; padding: 0 4px; margin-right: 6px;
   }
+  .ref-item.flash { animation: ref-flash 1.2s ease; }
+  @keyframes ref-flash {
+    0% { background: var(--accent-soft); border-color: var(--accent); }
+    100% { background: var(--bg-soft); border-color: var(--border); }
+  }
+  .cite {
+    cursor: pointer; color: var(--accent); font-weight: 600; font-size: 0.85em;
+    user-select: none; vertical-align: super; line-height: 1;
+  }
+  .cite:hover { text-decoration: underline; }
 
   /* 输入区 */
   .composer-wrap { flex-shrink: 0; padding: 8px 24px 18px; }
@@ -564,16 +574,38 @@
   const scrollBottom = () => { chatScroll.scrollTop = chatScroll.scrollHeight; };
   const esc = (s) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   const md = (text) => {
+    // 内联引用角标: [n] -> 可点击 sup (代码块内的 [n] 不转换)
+    const cite = (seg) => seg.replace(
+      /\[(\d{1,3})\]/g,
+      '<sup class="cite" data-ref="$1">[$1]</sup>'
+    );
+    const parts = String(text).split(/(```[\s\S]*?```)/);
+    const transformed = parts.map((p, i) => (i % 2 ? p : cite(p))).join("");
     if (window.marked) {
       marked.setOptions({ breaks: true, gfm: true });
-      return marked.parse(text);
+      return marked.parse(transformed);
     }
-    return "<p>" + esc(text).replace(/\n/g, "<br>") + "</p>";
+    return "<p>" + esc(transformed).replace(/\n/g, "<br>") + "</p>";
   };
   const showToast = (msg, ms = 2600) => {
     toast.textContent = msg; toast.classList.add("show");
     setTimeout(() => toast.classList.remove("show"), ms);
   };
+  /* 点击内联引用角标 [n]: 展开参考来源并高亮对应条目 */
+  document.addEventListener("click", (ev) => {
+    const cite = ev.target.closest(".cite");
+    if (!cite) return;
+    const msg = cite.closest(".msg");
+    if (!msg) return;
+    const target = [...msg.querySelectorAll(".ref-item")].find(
+      (r) => (r.querySelector(".ref-id")?.textContent || "").trim() === cite.dataset.ref
+    );
+    if (!target) return;
+    const refs = target.closest(".refs");
+    if (refs) refs.open = true;
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.classList.remove("flash"); void target.offsetWidth; target.classList.add("flash");
+  });
   /* 助手头像: xFusion 红底 + 白色 ∝ 记号 */
   const avatarSvg = () => `
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none">

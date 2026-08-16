@@ -358,3 +358,105 @@ async def test_e2e_two_instances_share_pg_state(pg_config):
     assert rec["status"] == "PROCESSED"
     res = await rag2.aquery("云脑平台是什么?", QueryParam(mode="hybrid"))
     assert res.raw_data["chunks"]
+
+
+# ---------------------------------------------------------------------------
+# 跨进程协调与事务: 文档咨询锁 / 跨存储单事务 / 缓存 TTL
+# ---------------------------------------------------------------------------
+
+
+@needs_vec
+async def test_doc_advisory_lock_held_during_insert(pg_config, fake_llm):
+    """导入进行中可在 pg_locks 观测到该 doc 的咨询锁, 结束后释放。"""
+    import asyncio
+    import dataclasses
+
+    import asyncpg
+
+    from fusionrag.storage_pg import doc_lock_key
+
+    class SlowLLM:  # 拉长导入窗口, 保证锁检查时导入仍在进行
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def __call__(self, *a, **kw):
+            await asyncio.sleep(0.3)
+            return await self._inner(*a, **kw)
+
+    cfg = dataclasses.replace(pg_config, llm_func=SlowLLM(fake_llm))
+    doc_id = "lock-" + uuid.uuid4().hex[:8]
+    rag = FusionRAG(cfg)
+
+    task = asyncio.create_task(rag.ainsert(SAMPLE_DOC, doc_id=doc_id))
+    # 等到导入真正开始 (PROCESSING 写入) 再查锁
+    for _ in range(100):
+        rec = await rag.full_docs.get_by_id(doc_id)
+        if rec and rec.get("status") == "PROCESSING":
+            break
+        await asyncio.sleep(0.05)
+
+    conn = await asyncpg.connect(pg_config.postgres_dsn)
+    key = doc_lock_key(doc_id)
+    held = await conn.fetchval(
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+        "AND classid=$1 AND objid=$2",
+        (key >> 32) & 0xFFFFFFFF, key & 0xFFFFFFFF,
+    )
+    await conn.close()
+    assert held == 1, "导入进行中应持有该文档的咨询锁"
+
+    await task  # 导入完成
+    conn = await asyncpg.connect(pg_config.postgres_dsn)
+    released = await conn.fetchval(
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+        "AND classid=$1 AND objid=$2",
+        (key >> 32) & 0xFFFFFFFF, key & 0xFFFFFFFF,
+    )
+    await conn.close()
+    assert released == 0, "导入结束后咨询锁应释放"
+
+
+@needs_vec
+async def test_multi_storage_tx_rollback(pg_config):
+    """跨存储事务: 事务内异常 -> 全部存储的改动回滚。"""
+    rag = FusionRAG(pg_config)
+    # 单 DSN (vec==age) 才启用事务; 拆分实例时跳过
+    if rag._tx_storages is None:
+        pytest.skip("跨存储事务需要单实例全家桶 (PG_TEST_DSN == AGE_TEST_DSN)")
+
+    marker = "tx-" + uuid.uuid4().hex[:8]
+    with pytest.raises(RuntimeError):
+        async with rag._atomic_tx():
+            await rag.full_docs.upsert({marker: {"status": "SHOULD_ROLLBACK"}})
+            await rag.text_chunks.upsert({marker: {"content": "x"}})
+            raise RuntimeError("boom")
+    assert await rag.full_docs.get_by_id(marker) is None
+    assert await rag.text_chunks.get_by_id(marker) is None
+
+    # 正常提交路径
+    async with rag._atomic_tx():
+        await rag.full_docs.upsert({marker: {"status": "OK"}})
+    assert (await rag.full_docs.get_by_id(marker))["status"] == "OK"
+    await rag.full_docs.delete([marker])
+
+
+@needs_vec
+async def test_kv_ttl_delete_older_than(ns):
+    kv = PostgresKVStorage(ns, VEC_DSN)
+    await kv.upsert({"fresh": {"x": 1}, "old": {"x": 2}})
+    # 手动把 old 的 stored_at 拨回 10 天前
+    import asyncpg
+
+    conn = await asyncpg.connect(VEC_DSN)
+    await conn.execute(
+        f"UPDATE public.kv_{ns} SET stored_at = now() - interval '10 days' "
+        "WHERE key = 'old'"
+    )
+    await conn.close()
+
+    deleted = await kv.delete_older_than(5)
+    assert deleted == 1
+    assert await kv.get_by_id("old") is None
+    assert await kv.get_by_id("fresh") == {"x": 1}
+    # TTL=0 语义由调用方保证 (llm.py 直接跳过), 这里验证大天数不误删
+    assert await kv.delete_older_than(365) == 0

@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from .config import FusionRAGConfig
 from .core import FusionRAG
 from .query import QUERY_MODES, QueryParam
+from .utils import compute_mdhash_id
 
 logger = logging.getLogger("fusionrag.api")
 
@@ -39,6 +40,11 @@ logger = logging.getLogger("fusionrag.api")
 class DocumentImportRequest(BaseModel):
     document: str = Field(..., min_length=1, description="Markdown 或纯文本长文本")
     doc_id: Optional[str] = Field(None, description="可选文档 id, 缺省按内容哈希生成")
+    wait: bool = Field(
+        True,
+        description="True 同步等待导入完成; False 立即返回 PROCESSING, 后台执行, "
+        "用 GET /api/v1/document/{doc_id} 轮询状态",
+    )
 
 
 class ChatCompletionRequest(BaseModel):
@@ -66,6 +72,7 @@ def create_app(rag: Optional[FusionRAG] = None) -> FastAPI:
     rag = rag or FusionRAG(FusionRAGConfig.from_env())
     app = FastAPI(title="FusionRAG", version="0.1.0")
     app.state.rag = rag
+    app.state.import_tasks: set[asyncio.Task] = set()  # 后台导入任务引用
 
     webui_index = Path(__file__).resolve().parent.parent / "webui" / "index.html"
 
@@ -104,11 +111,47 @@ def create_app(rag: Optional[FusionRAG] = None) -> FastAPI:
     # ---------------------------------------------------------- 文档导入
     @app.post("/api/v1/document/import")
     async def import_document(req: DocumentImportRequest):
+        if not req.wait:
+            # 异步导入: 立即返回 PROCESSING, 后台跑流水线, 状态可轮询
+            doc_id = req.doc_id or compute_mdhash_id(req.document, prefix="doc-")
+
+            def _on_done(task: asyncio.Task) -> None:
+                app.state.import_tasks.discard(task)
+                if not task.cancelled() and task.exception() is not None:
+                    logger.error("后台导入 %s 失败: %s", doc_id, task.exception())
+
+            task = asyncio.create_task(
+                rag.ainsert(req.document, doc_id=req.doc_id)
+            )
+            task.add_done_callback(_on_done)
+            app.state.import_tasks.add(task)  # 持引用防 GC
+            return _ok({"doc_id": doc_id, "status": "PROCESSING", "async": True})
         try:
             result = await rag.ainsert(req.document, doc_id=req.doc_id)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return _ok(result)
+
+    # ---------------------------------------------------------- 文档状态
+    @app.get("/api/v1/document/{doc_id}")
+    async def get_document(doc_id: str):
+        """查询单个文档的导入状态 (异步导入的轮询端点)。"""
+        rec = await rag.full_docs.get_by_id(doc_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail=f"文档不存在: {doc_id}")
+        return _ok(
+            {
+                "doc_id": doc_id,
+                "title": rec.get("title") or doc_id,
+                "status": rec.get("status", "UNKNOWN"),
+                "chunks": rec.get("chunks_count", 0),
+                "entities": rec.get("entities_count", 0),
+                "relations": rec.get("relations_count", 0),
+                "error_msg": rec.get("error_msg"),
+                "created_at": rec.get("created_at", 0),
+                "updated_at": rec.get("updated_at", 0),
+            }
+        )
 
     # ---------------------------------------------------------- 文档列表
     @app.get("/api/v1/documents")
@@ -237,14 +280,20 @@ def create_app(rag: Optional[FusionRAG] = None) -> FastAPI:
                 if req.include_references:
                     refs = result.raw_data.get("references", [])
                     yield f"data: {json.dumps({'session_id': req.session_id, 'references': refs}, ensure_ascii=False)}\n\n"
-                # 流式结束后落会话历史
-                await rag.sessions.append_turn(
-                    req.session_id, req.message, "".join(collected)
-                )
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 logger.exception("流式生成失败")
                 yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+            finally:
+                # 客户端中途断连 (GeneratorExit/CancelledError) 也把已生成的
+                # 部分答案落进会话历史, 否则该轮对话丢失、上下文断裂
+                if collected:
+                    try:
+                        await rag.sessions.append_turn(
+                            req.session_id, req.message, "".join(collected)
+                        )
+                    except Exception:
+                        logger.exception("流式会话历史落盘失败")
 
         return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
