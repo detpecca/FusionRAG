@@ -125,6 +125,7 @@ docker compose -f docker-compose.pg.yml up -d   # 一键起 AGE+pgvector 合一�
 | `CHUNK_TOKEN_SIZE` / `CHUNK_OVERLAP_TOKEN_SIZE` | 1200 / 100 | 切分窗口与重叠 |
 | `TOP_K` / `CHUNK_TOP_K` | 40 / 20 | 检索广度 |
 | `MAX_GLEANING` | 1 | 补抽轮数 |
+| `ENTITY_DISAMBIGUATION` / `ENTITY_ALIAS_SIMILARITY_THRESHOLD` | true / 0.78 | 实体消歧：别名归一到规范名（embedding 预筛 + LLM 确认，结果持久化复用）；阈值调低可覆盖跨语言别名（抖音/TikTok 实测 0.65），代价是更多确认调用 |
 | `DELETE_REBUILD_DESCRIPTIONS` | true | 删除文档时重建存活实体/关系描述 |
 | `LLM_CACHE_TTL_DAYS` | 30 | LLM 缓存保留天数（仅 PG KV 后端生效；0=永不过期） |
 | `KV_BACKEND` | json | KV 后端：`json` / `sqlite` / `postgres` |

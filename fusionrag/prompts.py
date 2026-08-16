@@ -217,6 +217,22 @@ Consider the conversation history if provided to maintain conversational flow an
 
 PROMPTS["naive_rag_response"] = PROMPTS["rag_response"]
 
+PROMPTS["entity_alias_check"] = """---Role---
+You are an Entity Alias Judge for knowledge graph construction.
+
+---Task---
+The user message contains two entity names. Decide whether they refer to the
+SAME real-world entity (alias, abbreviation, full name, translation, or
+spelling variant), or two DIFFERENT entities.
+
+---Instructions---
+- Judge only by the names themselves; do not speculate beyond common knowledge
+  of well-known organizations/products/people.
+- When uncertain, answer NO (keeping entities separate is safe, merging
+  different entities is not recoverable).
+- Output exactly one line: YES or NO. No explanation.
+"""
+
 PROMPTS["fail_response"] = (
     "Sorry, I'm not able to provide an answer to that question. "
     "The knowledge base does not contain enough relevant information."

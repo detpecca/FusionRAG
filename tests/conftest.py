@@ -27,10 +27,12 @@ GLEANING_EXTRACTION = (
 
 
 class FakeLLM:
-    """按 prompt 特征分发: 抽取 / 关键词 / 摘要 / 问答。"""
+    """按 prompt 特征分发: 抽取 / 关键词 / 摘要 / 问答 / 别名确认。"""
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        # 实体消歧: 出现在同一 prompt 中即回答 YES 的名字对 (测试控制)
+        self.alias_pairs: list[set[str]] = []
 
     async def __call__(
         self,
@@ -47,6 +49,12 @@ class FakeLLM:
             if "missed or incorrectly formatted" in prompt:
                 return GLEANING_EXTRACTION
             return CANNED_EXTRACTION
+        # 实体别名确认 (实体消歧)
+        if "Entity Alias Judge" in sys:
+            yes = any(
+                all(n in prompt for n in pair) for pair in self.alias_pairs
+            )
+            return "YES" if yes else "NO"
         # 查询关键词提取 (无 system prompt, 内容特征)
         if "high_level_keywords" in prompt:
             return '{"high_level_keywords": ["图增强检索", "知识图谱"], "low_level_keywords": ["星尘科技", "云脑平台"]}'

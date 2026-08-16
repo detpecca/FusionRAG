@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 from .chunking import chunking_by_token_size
 from .config import FusionRAGConfig
+from .disambiguate import resolve_entity_aliases
 from .extract import extract_entities
 from .llm import LLMService
 from .merge import _combine_descriptions, _vote_entity_type, merge_nodes_and_edges
@@ -103,6 +104,7 @@ class FusionRAG:
         self.llm_cache = create_kv_storage("llm_cache", wd, self.config)            # LLM 结果缓存
         self.entity_chunks = create_kv_storage("entity_chunks", wd, self.config)    # 实体->chunk 账本
         self.relation_chunks = create_kv_storage("relation_chunks", wd, self.config)  # 关系->chunk 账本
+        self.entity_aliases = create_kv_storage("entity_aliases", wd, self.config)    # 别名->规范名 (实体消歧)
 
         # LLM / embedding
         self.llm = LLMService(self.config, cache_kv=self.llm_cache)
@@ -304,6 +306,14 @@ class FusionRAG:
                     # 3. 实体/关系抽取 (含 gleaning 补抽), 逐 chunk 汇报进度
                     nodes, edges = await extract_entities(
                         chunks, self.llm, self.config, progress_callback=notify
+                    )
+
+                    # 3.5 实体消歧: 别名归一到规范名 (embedding 预筛 + LLM 确认,
+                    # 确认结果持久化, 后续导入零成本), 再进入合并
+                    nodes, edges, _alias_map = await resolve_entity_aliases(
+                        nodes, edges,
+                        await self.entity_chunks.keys(),
+                        self.entity_aliases, self.llm, self.config,
                     )
 
                     # 4. 去重合并: 写图谱 + 实体/关系向量库
@@ -523,6 +533,16 @@ class FusionRAG:
         await self.graph.remove_node(name)
         await self.entities_vdb.delete([compute_mdhash_id(name, prefix="ent-")])
         await self.entity_chunks.delete([name])
+        # 连带清理指向该实体的别名映射 (孤儿别名会把后续导入指向不存在的规范名)
+        alias_keys = await self.entity_aliases.keys()
+        if alias_keys:
+            alias_records = await self.entity_aliases.get_by_ids(alias_keys)
+            stale = [
+                k for k, rec in zip(alias_keys, alias_records)
+                if rec and rec.get("canonical") == name
+            ]
+            if stale:
+                await self.entity_aliases.delete(stale)
         stats["entities_deleted"] += 1
 
     async def _delete_relation(self, src: str, tgt: str, stats: dict) -> None:
@@ -632,6 +652,7 @@ class FusionRAG:
             self.text_chunks.index_done_callback(),
             self.entity_chunks.index_done_callback(),
             self.relation_chunks.index_done_callback(),
+            self.entity_aliases.index_done_callback(),
             self.chunks_vdb.index_done_callback(),
             self.entities_vdb.index_done_callback(),
             self.relationships_vdb.index_done_callback(),

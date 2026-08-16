@@ -103,6 +103,8 @@ class FusionRAGConfig:
     max_entity_records: int = 40           # 单次抽取实体数量上限
     max_total_records: int = 100           # 单次抽取实体+关系总数上限
     language: str = "Chinese"              # 抽取与回答使用的语言
+    entity_disambiguation: bool = True     # 合并前按别名归一实体名 (embedding 预筛 + LLM 确认)
+    entity_alias_similarity_threshold: float = 0.78  # 进入 LLM 确认的名称相似度下限
 
     # ---- 合并/摘要 ----
     summary_max_tokens: int = 1200         # 描述合并后超过该 token 数则调 LLM 摘要
@@ -173,6 +175,13 @@ class FusionRAGConfig:
             ),
             entity_extract_max_gleaning=_env_int(
                 "MAX_GLEANING", cls.entity_extract_max_gleaning
+            ),
+            entity_disambiguation=_env(
+                "ENTITY_DISAMBIGUATION", "true"
+            ).lower() == "true",
+            entity_alias_similarity_threshold=_env_float(
+                "ENTITY_ALIAS_SIMILARITY_THRESHOLD",
+                cls.entity_alias_similarity_threshold,
             ),
             language=_env("SUMMARY_LANGUAGE", cls.language),
             summary_max_tokens=_env_int("SUMMARY_MAX_TOKENS", cls.summary_max_tokens),
